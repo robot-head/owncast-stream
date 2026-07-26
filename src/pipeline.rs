@@ -384,6 +384,7 @@ struct ReadyState {
     enter_pressed: bool,
     failure: Option<String>,
     pending_pads: Vec<PendingPad>,
+    claimed_streams: Vec<(String, gst::Pad)>,
     blocking_probes: Option<BlockingProbes>,
 }
 
@@ -433,14 +434,35 @@ fn resolve_pending_pads(
         } else {
             None
         };
-        if let Some(sink) = sink
-            && pending.pad.peer().as_ref() != Some(sink)
-            && let Err(failure) = pending.pad.link(sink)
-        {
-            retain_lobby(
-                ready,
-                format!("Cannot link selected stream {stream_id}: {failure}"),
-            );
+        if let Some(sink) = sink {
+            let mut state = ready.0.lock().unwrap();
+            if state
+                .claimed_streams
+                .iter()
+                .any(|(claimed_id, claimed_sink)| claimed_id == stream_id && claimed_sink == sink)
+            {
+                continue;
+            }
+            state
+                .claimed_streams
+                .push((stream_id.to_owned(), sink.clone()));
+            drop(state);
+            if pending.pad.peer().as_ref() != Some(sink)
+                && let Err(failure) = pending.pad.link(sink)
+            {
+                ready
+                    .0
+                    .lock()
+                    .unwrap()
+                    .claimed_streams
+                    .retain(|(claimed_id, claimed_sink)| {
+                        claimed_id != stream_id || claimed_sink != sink
+                    });
+                retain_lobby(
+                    ready,
+                    format!("Cannot link selected stream {stream_id}: {failure}"),
+                );
+            }
         }
     }
     ready.0.lock().unwrap().pending_pads.extend(unresolved);
@@ -1081,6 +1103,49 @@ mod tests {
         resolve_pending_pads(&ready, &selection, &sinks);
 
         assert_eq!(video_src.peer(), Some(video_sink));
+        assert!(ready.0.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn repeated_selected_stream_resolution_links_once() {
+        gst::init().unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let selection = OnceLock::new();
+        selection
+            .set(Selection {
+                video_id: "video".into(),
+                audio_id: "audio".into(),
+                subtitle: SubtitleSource::None,
+            })
+            .unwrap();
+        let first_video_src = gst::Pad::builder(gst::PadDirection::Src)
+            .name("first-video-src")
+            .build();
+        let repeated_video_src = gst::Pad::builder(gst::PadDirection::Src)
+            .name("repeated-video-src")
+            .build();
+        let video_sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("video-sink")
+            .build();
+        let sinks = SelectedSinks {
+            video: video_sink.clone(),
+            audio: gst::Pad::new(gst::PadDirection::Sink),
+            subtitle: gst::Pad::new(gst::PadDirection::Sink),
+        };
+        ready.0.lock().unwrap().pending_pads.extend([
+            PendingPad {
+                pad: first_video_src.clone(),
+                stream_id: Some("video".into()),
+            },
+            PendingPad {
+                pad: repeated_video_src,
+                stream_id: Some("video".into()),
+            },
+        ]);
+
+        resolve_pending_pads(&ready, &selection, &sinks);
+
+        assert_eq!(video_sink.peer(), Some(first_video_src));
         assert!(ready.0.lock().unwrap().failure.is_none());
     }
 
