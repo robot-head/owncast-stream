@@ -247,12 +247,14 @@ mode `0600` and exact `capture=PASS\n` only after collector exit zero.
 - [ ] **Step 3: Run the supervisor once**
 
 ```bash
-sudo timeout 230s python3 \
+sudo python3 \
   /var/tmp/attempt10-python-supervisor/supervise.py \
   "$evidence_path" "$run_log_dir"
 ```
 
-Do not manually send Enter. Do not retry any live failure.
+Rely on the supervisor's reviewed internal phase deadlines and bounded cleanup;
+an outer timeout must not preempt its `finally` block. Do not manually send
+Enter. Do not retry any live failure.
 
 - [ ] **Step 4: Verify, seal, and record**
 
