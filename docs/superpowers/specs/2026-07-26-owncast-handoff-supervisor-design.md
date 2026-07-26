@@ -15,18 +15,17 @@ HLS collector unchanged.
 The supervisor:
 
 1. starts the exact Passenger stream with `subprocess.Popen`, stdin connected
-   to a pipe, and line-buffered output captured to a private log;
+   to a pipe, and output captured to a private diagnostic log;
 2. polls the loopback Owncast status API at 100 ms intervals with
    `urllib.request`;
-3. waits for both `Lobby is live` in the process log and API status proving
-   `online=true`, title `Starting soon: Passenger`, and a nonempty
-   `lastConnectTime`;
+3. requires the child to remain alive and API status to prove `online=true`,
+   title `Starting soon: Passenger`, and a nonempty `lastConnectTime`;
 4. calculates a conservative upper-bound delay from `lastConnectTime` to the
    local proof timestamp and refuses the handoff if it exceeds five seconds;
 5. writes exactly one newline to the child stdin pipe, records the timestamp,
    closes stdin, and rejects any second send;
-6. waits for `Movie is live`, title `Passenger`, unchanged
-   `lastConnectTime`, and exactly one inbound connection;
+6. waits for API title `Passenger`, unchanged `lastConnectTime`, exactly one
+   inbound connection, and a still-running child;
 7. polls the expected fresh evidence path for the collector's root-owned,
    regular `capture-status.txt` success marker;
 8. forwards one SIGINT to the streamer, waits with a bounded timeout, and
@@ -38,6 +37,10 @@ title mismatch, reconnect, or duplicate handoff stops the streamer safely and
 produces no successful capture claim.
 The supervisor contains and prints no stream key, title token, password,
 cookie, or Authorization value.
+
+The captured stdout lines are diagnostic only. Rust buffers stdout when it is
+redirected to a file, so lobby and movie messages can appear only during
+shutdown and cannot serve as bounded readiness gates.
 
 ## Scope
 
@@ -54,7 +57,8 @@ A non-network self-test uses fake status responses and a real harmless child
 process to prove:
 
 - the child launches without blocking;
-- a valid lobby proof writes exactly one newline and closes stdin;
+- a live child plus valid API lobby proof writes exactly one newline and
+  closes stdin;
 - a proof over five seconds causes no newline;
 - a title or connection change fails;
 - cleanup waits for an explicit child-ready line, sends one SIGINT, and reaps
