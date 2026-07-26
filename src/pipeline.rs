@@ -19,7 +19,7 @@ use crate::{
     set_title,
 };
 
-const SUBTITLE_TS_OFFSET_NS: i64 = -100_000_000;
+const SUBTITLE_ADVANCE_NS: u64 = 100_000_000;
 
 fn rebase_timestamp(timestamp: u64, boundary: u64, first_pts: u64) -> Result<u64, String> {
     let rebased = i128::from(timestamp) + i128::from(boundary) - i128::from(first_pts);
@@ -769,10 +769,29 @@ fn add_external_subtitles(
     let output = subtitles
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?;
-    output.set_offset(SUBTITLE_TS_OFFSET_NS);
+    add_subtitle_timestamp_probe(&output)
+        .ok_or_else(|| error("Cannot install external subtitle timestamp correction"))?;
     output.link(sink)?;
     subtitles.sync_state_with_parent()?;
     Ok(())
+}
+
+fn add_subtitle_timestamp_probe(pad: &gst::Pad) -> Option<gst::PadProbeId> {
+    pad.add_probe(gst::PadProbeType::BUFFER, |_, info| {
+        let Some(buffer) = info.buffer_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let pts = buffer.pts().map(|timestamp| {
+            gst::ClockTime::from_nseconds(timestamp.nseconds().saturating_sub(SUBTITLE_ADVANCE_NS))
+        });
+        let dts = buffer.dts().map(|timestamp| {
+            gst::ClockTime::from_nseconds(timestamp.nseconds().saturating_sub(SUBTITLE_ADVANCE_NS))
+        });
+        let buffer = buffer.make_mut();
+        buffer.set_pts(pts);
+        buffer.set_dts(dts);
+        gst::PadProbeReturn::Ok
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1526,11 +1545,48 @@ mod tests {
         assert!(parts.movie_subtitle_sink.peer().is_none());
         add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
 
-        assert_eq!(
-            parts.movie_subtitle_sink.peer().unwrap().offset(),
-            SUBTITLE_TS_OFFSET_NS
-        );
+        assert!(parts.movie_subtitle_sink.peer().is_some());
         fs::remove_file(subtitle).unwrap();
+    }
+
+    #[test]
+    fn subtitle_timestamp_probe_advances_pts_and_dts_by_100ms() {
+        let _gst = gst_test();
+        let source = gst::Pad::new(gst::PadDirection::Src);
+        let (buffer_tx, buffer_rx) = mpsc::channel();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .chain_function(move |_, _, buffer| {
+                buffer_tx
+                    .send((buffer.pts(), buffer.dts(), buffer.duration()))
+                    .unwrap();
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build();
+        source.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        source.link(&sink).unwrap();
+        source.push_event(gst::event::StreamStart::new("subtitles"));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        source.push_event(gst::event::Segment::new(segment.as_ref()));
+        let _probe = add_subtitle_timestamp_probe(&source).unwrap();
+
+        let mut buffer = gst::Buffer::new();
+        {
+            let buffer = buffer.get_mut().unwrap();
+            buffer.set_pts(gst::ClockTime::from_mseconds(200));
+            buffer.set_dts(gst::ClockTime::from_mseconds(250));
+            buffer.set_duration(gst::ClockTime::from_seconds(1));
+        }
+        source.push(buffer).unwrap();
+
+        assert_eq!(
+            buffer_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (
+                Some(gst::ClockTime::from_mseconds(100)),
+                Some(gst::ClockTime::from_mseconds(150)),
+                Some(gst::ClockTime::from_seconds(1)),
+            )
+        );
     }
 
     #[test]
