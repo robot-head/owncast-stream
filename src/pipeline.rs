@@ -81,36 +81,84 @@ unsafe extern "C" {
         data: *mut c_void,
         notify: unsafe extern "C" fn(*mut c_void),
     ) -> u32;
+    fn g_source_remove(tag: u32) -> i32;
+}
+
+struct SignalData {
+    bus: gst::Bus,
+    removed: Arc<AtomicBool>,
 }
 
 unsafe extern "C" fn post_interrupt(data: *mut c_void) -> i32 {
-    // SAFETY: GLib calls this with the boxed bus passed to g_unix_signal_add_full.
-    let bus = unsafe { &*(data.cast::<gst::Bus>()) };
-    bus.post(
+    // SAFETY: GLib calls this with the boxed data passed to g_unix_signal_add_full.
+    let data = unsafe { &*(data.cast::<SignalData>()) };
+    let _ = data.bus.post(
         gst::message::Application::builder(gst::Structure::builder("owncast-interrupt").build())
             .build(),
-    )
-    .expect("pipeline bus accepts interrupt");
+    );
+    data.removed.store(true, Ordering::Release);
     0
 }
 
 unsafe extern "C" fn drop_signal_bus(data: *mut c_void) {
     // SAFETY: GLib invokes destroy notify exactly once for this Box::into_raw pointer.
-    drop(unsafe { Box::from_raw(data.cast::<gst::Bus>()) });
+    drop(unsafe { Box::from_raw(data.cast::<SignalData>()) });
 }
 
-fn register_sigint(bus: &gst::Bus) {
-    let data = Box::into_raw(Box::new(bus.clone())).cast();
+struct SignalGuard {
+    id: u32,
+    removed: Arc<AtomicBool>,
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        if !self.removed.swap(true, Ordering::AcqRel) {
+            // SAFETY: id is a live GLib source owned by this guard.
+            unsafe {
+                g_source_remove(self.id);
+            }
+        }
+    }
+}
+
+type SignalRegistrar = unsafe extern "C" fn(
+    i32,
+    i32,
+    unsafe extern "C" fn(*mut c_void) -> i32,
+    *mut c_void,
+    unsafe extern "C" fn(*mut c_void),
+) -> u32;
+
+fn register_sigint_with(
+    bus: &gst::Bus,
+    registrar: SignalRegistrar,
+) -> Result<SignalGuard, Box<dyn Error>> {
+    let removed = Arc::new(AtomicBool::new(false));
+    let data = Box::into_raw(Box::new(SignalData {
+        bus: bus.clone(),
+        removed: removed.clone(),
+    }))
+    .cast();
     // SAFETY: callbacks use the boxed GstBus until GLib calls the destroy notifier.
-    unsafe {
-        g_unix_signal_add_full(
+    let id = unsafe {
+        registrar(
             gst::glib::Priority::DEFAULT.into_glib(),
             2,
             post_interrupt,
             data,
             drop_signal_bus,
-        );
+        )
+    };
+    if id == 0 {
+        // SAFETY: a failed registration did not transfer ownership to GLib.
+        drop(unsafe { Box::from_raw(data.cast::<SignalData>()) });
+        return Err(error("Cannot register SIGINT handler"));
     }
+    Ok(SignalGuard { id, removed })
+}
+
+fn register_sigint(bus: &gst::Bus) -> Result<SignalGuard, Box<dyn Error>> {
+    register_sigint_with(bus, g_unix_signal_add_full)
 }
 
 const REQUIRED_ELEMENTS: &[&str] = &[
@@ -206,7 +254,7 @@ impl PipelineParts {
                 sync-mode=clock cache-buffers=true drop-backwards=true
               ! videoconvert
               ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
-              ! x264enc bitrate=6000 key-int-max=60 bframes=0
+              ! x264enc name=video_encoder bitrate=6000 key-int-max=60 bframes=0
                   tune=zerolatency speed-preset=medium
               ! h264parse config-interval=1
               ! queue
@@ -220,7 +268,7 @@ impl PipelineParts {
               ! audiocheblimit mode=high-pass cutoff=80 poles=4
               ! audiodynamic mode=compressor characteristics=soft-knee
                   threshold=0.125 ratio=2.0
-              ! avenc_aac bitrate=192000
+              ! avenc_aac name=audio_encoder bitrate=192000
               ! aacparse
               ! queue
               ! mux.
@@ -330,6 +378,140 @@ struct ReadyState {
     audio_pts: Option<gst::ClockTime>,
     enter_pressed: bool,
     failure: Option<String>,
+    pending_pads: Vec<PendingPad>,
+}
+
+struct PendingPad {
+    pad: gst::Pad,
+    stream_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct SelectedSinks {
+    video: gst::Pad,
+    audio: gst::Pad,
+    subtitle: gst::Pad,
+}
+
+fn retain_lobby(ready: &Arc<(Mutex<ReadyState>, Condvar)>, reason: impl Into<String>) {
+    let reason = reason.into();
+    eprintln!("{reason}; the lobby will remain live until Ctrl-C.");
+    ready.0.lock().unwrap().failure = Some(reason);
+    ready.1.notify_all();
+}
+
+fn resolve_pending_pads(
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    selection: &OnceLock<Selection>,
+    sinks: &SelectedSinks,
+) {
+    let Some(selection) = selection.get() else {
+        return;
+    };
+    let pending = std::mem::take(&mut ready.0.lock().unwrap().pending_pads);
+    let mut unresolved = Vec::new();
+    for pending in pending {
+        let Some(stream_id) = pending.stream_id.as_deref() else {
+            unresolved.push(pending);
+            continue;
+        };
+        let sink = if stream_id == selection.video_id {
+            Some(&sinks.video)
+        } else if stream_id == selection.audio_id {
+            Some(&sinks.audio)
+        } else if matches!(
+            &selection.subtitle,
+            SubtitleSource::Embedded(id) if stream_id == id
+        ) {
+            Some(&sinks.subtitle)
+        } else {
+            None
+        };
+        if let Some(sink) = sink
+            && pending.pad.peer().as_ref() != Some(sink)
+            && let Err(failure) = pending.pad.link(sink)
+        {
+            retain_lobby(
+                ready,
+                format!("Cannot link selected stream {stream_id}: {failure}"),
+            );
+        }
+    }
+    ready.0.lock().unwrap().pending_pads.extend(unresolved);
+}
+
+fn watch_movie_pad(
+    pad: &gst::Pad,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    selection: &Arc<OnceLock<Selection>>,
+    sinks: &SelectedSinks,
+) {
+    ready.0.lock().unwrap().pending_pads.push(PendingPad {
+        pad: pad.clone(),
+        stream_id: None,
+    });
+    let seen = Arc::new(AtomicBool::new(false));
+    let probe_seen = seen.clone();
+    let probe_ready = ready.clone();
+    let probe_selection = selection.clone();
+    let probe_sinks = sinks.clone();
+    let probe_id = pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
+        let Some(gst::EventView::StreamStart(event)) = info.event().map(|event| event.view())
+        else {
+            return gst::PadProbeReturn::Ok;
+        };
+        if !probe_seen.swap(true, Ordering::AcqRel) {
+            if let Some(pending) = probe_ready
+                .0
+                .lock()
+                .unwrap()
+                .pending_pads
+                .iter_mut()
+                .find(|pending| pending.pad == *pad)
+            {
+                pending.stream_id = Some(event.stream_id().to_owned());
+            }
+            resolve_pending_pads(&probe_ready, &probe_selection, &probe_sinks);
+        }
+        gst::PadProbeReturn::Remove
+    });
+    if let Some(event) = pad.sticky_event::<gst::event::StreamStart>(0)
+        && !seen.swap(true, Ordering::AcqRel)
+    {
+        if let Some(pending) = ready
+            .0
+            .lock()
+            .unwrap()
+            .pending_pads
+            .iter_mut()
+            .find(|pending| pending.pad == *pad)
+        {
+            pending.stream_id = Some(event.stream_id().to_owned());
+        }
+        resolve_pending_pads(ready, selection, sinks);
+        if let Some(probe_id) = probe_id {
+            pad.remove_probe(probe_id);
+        }
+    } else if probe_id.is_none() {
+        retain_lobby(ready, format!("Cannot inspect movie pad {}", pad.name()));
+    }
+}
+
+fn fatal_pipeline_error(
+    message: &gst::MessageRef,
+    pipeline: &gst::Pipeline,
+    switched: bool,
+) -> bool {
+    switched
+        || message.src().is_some_and(|source| {
+            ["video_encoder", "audio_encoder", "mux", "output"]
+                .into_iter()
+                .filter_map(|name| pipeline.by_name(name))
+                .any(|element| {
+                    source == element.upcast_ref::<gst::Object>()
+                        || source.has_as_ancestor(&element)
+                })
+        })
 }
 
 fn record_first_pts(
@@ -352,6 +534,52 @@ fn record_first_pts(
     *slot = Some(pts);
     drop(state);
     ready.1.notify_all();
+}
+
+struct BlockingProbes {
+    video: Option<(gst::Pad, gst::PadProbeId)>,
+    audio: Option<(gst::Pad, gst::PadProbeId)>,
+}
+
+impl BlockingProbes {
+    fn release(&mut self) {
+        if let Some((pad, id)) = self.video.take() {
+            pad.remove_probe(id);
+        }
+        if let Some((pad, id)) = self.audio.take() {
+            pad.remove_probe(id);
+        }
+    }
+}
+
+impl Drop for BlockingProbes {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn post_application_error(bus: &gst::Bus, name: &str, failure: impl ToString) {
+    let structure = gst::Structure::builder(name)
+        .field("error", failure.to_string())
+        .build();
+    let _ = bus.post(gst::message::Application::builder(structure).build());
+}
+
+fn application_failure(message: &gst::MessageRef) -> Option<String> {
+    let gst::MessageView::Application(application) = message.view() else {
+        return None;
+    };
+    let structure = application.structure()?;
+    let fallback = match structure.name().as_str() {
+        "owncast-title-error" => "Cannot update Owncast title",
+        "owncast-switch-error" => "Cannot schedule movie handoff",
+        _ => return None,
+    };
+    Some(
+        structure
+            .get::<String>("error")
+            .unwrap_or_else(|_| fallback.into()),
+    )
 }
 
 fn add_external_subtitles(
@@ -413,38 +641,19 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         )
         .ok_or_else(|| error("Cannot block movie audio"))?;
 
+    let sinks = SelectedSinks {
+        video: parts.movie_video_sink.clone(),
+        audio: parts.movie_audio_sink.clone(),
+        subtitle: parts
+            .subtitle_overlay
+            .static_pad("subtitle_sink")
+            .ok_or_else(|| error("Subtitle overlay input is missing"))?,
+    };
     let selected = selection.clone();
-    let video_sink = parts.movie_video_sink.clone();
-    let audio_sink = parts.movie_audio_sink.clone();
-    let subtitle_sink = parts
-        .subtitle_overlay
-        .static_pad("subtitle_sink")
-        .ok_or_else(|| error("Subtitle overlay input is missing"))?;
+    let pad_ready = ready.clone();
+    let pad_sinks = sinks.clone();
     parts.movie.connect_pad_added(move |_, pad| {
-        let Some(stream_id) = pad
-            .sticky_event::<gst::event::StreamStart>(0)
-            .map(|event| event.stream_id().to_owned())
-        else {
-            return;
-        };
-        let Some(selected) = selected.get() else {
-            return;
-        };
-        let sink = if stream_id == selected.video_id {
-            &video_sink
-        } else if stream_id == selected.audio_id {
-            &audio_sink
-        } else if matches!(
-            &selected.subtitle,
-            SubtitleSource::Embedded(id) if stream_id == id.as_str()
-        ) {
-            &subtitle_sink
-        } else {
-            return;
-        };
-        if let Err(failure) = pad.link(sink) {
-            eprintln!("Cannot link selected stream {stream_id}: {failure}");
-        }
+        watch_movie_pad(pad, &pad_ready, &selected, &pad_sinks);
     });
 
     set_title(
@@ -478,6 +687,10 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let title_token = config.title_token.clone();
     let switch_flag = switched.clone();
     thread::spawn(move || {
+        let mut probes = BlockingProbes {
+            video: Some((movie_video_src, video_probe)),
+            audio: Some((movie_audio_src, audio_probe)),
+        };
         let mut state = switch_ready.0.lock().unwrap();
         while (state.video_pts.is_none() || state.audio_pts.is_none() || !state.enter_pressed)
             && state.failure.is_none()
@@ -492,33 +705,46 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         drop(state);
 
         let Some(clock) = switch_pipeline.clock() else {
+            post_application_error(
+                &switch_bus,
+                "owncast-switch-error",
+                "Pipeline clock is missing",
+            );
             return;
         };
         let Some(base_time) = switch_pipeline.base_time() else {
+            post_application_error(
+                &switch_bus,
+                "owncast-switch-error",
+                "Pipeline base time is missing",
+            );
             return;
         };
         let boundary = next_frame_boundary(clock.time().saturating_sub(base_time));
         movie_video_pad.set_offset(running_time_offset(boundary, video_pts));
         movie_audio_pad.set_offset(running_time_offset(boundary, audio_pts));
         let clock_id = clock.new_single_shot_id(base_time + boundary);
-        let _ = clock_id.wait_async(move |_, _, _| {
+        let schedule_bus = switch_bus.clone();
+        if let Err(failure) = clock_id.wait_async(move |_, _, _| {
             video_selector.set_property("active-pad", Some(&movie_video_pad));
             audio_selector.set_property("active-pad", Some(&movie_audio_pad));
-            movie_video_src.remove_probe(video_probe);
-            movie_audio_src.remove_probe(audio_probe);
+            probes.release();
             switch_flag.store(true, Ordering::Release);
             if let Err(failure) = set_title(&title_token, &title) {
-                let structure = gst::Structure::builder("owncast-title-error")
-                    .field("error", failure.to_string())
-                    .build();
-                let _ = switch_bus.post(gst::message::Application::builder(structure).build());
+                post_application_error(&switch_bus, "owncast-title-error", failure);
                 return;
             }
             println!("Movie is live.");
-        });
+        }) {
+            post_application_error(
+                &schedule_bus,
+                "owncast-switch-error",
+                format!("Cannot schedule movie handoff: {failure}"),
+            );
+        }
     });
 
-    register_sigint(&bus);
+    let _signal = register_sigint(&bus)?;
 
     let context = gst::glib::MainContext::default();
     loop {
@@ -544,20 +770,27 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
                     Ok(chosen) => {
                         match &chosen.subtitle {
                             SubtitleSource::External(path) => {
-                                add_external_subtitles(
+                                if let Err(failure) = add_external_subtitles(
                                     &parts.pipeline,
                                     &parts.subtitle_overlay,
                                     path,
-                                )?;
+                                ) {
+                                    retain_lobby(
+                                        &ready,
+                                        format!("Cannot prepare external subtitles: {failure}"),
+                                    );
+                                    continue;
+                                }
                             }
                             SubtitleSource::None => {
                                 parts.subtitle_overlay.set_property("silent", true);
                             }
                             SubtitleSource::Embedded(_) => {}
                         }
-                        selection
-                            .set(chosen)
-                            .map_err(|_| error("Movie streams were selected twice"))?;
+                        if selection.set(chosen).is_err() {
+                            retain_lobby(&ready, "Movie streams were selected twice");
+                            continue;
+                        }
                         let chosen = selection.get().unwrap();
                         let ids = [
                             Some(chosen.video_id.as_str()),
@@ -570,46 +803,34 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
                         .into_iter()
                         .flatten();
                         if !parts.movie.send_event(gst::event::SelectStreams::new(ids)) {
-                            return Err(error("Movie rejected selected streams"));
+                            retain_lobby(&ready, "Movie rejected selected streams");
+                            continue;
                         }
+                        resolve_pending_pads(&ready, &selection, &sinks);
                     }
                     Err(reason) => {
-                        eprintln!("{reason}; the lobby will remain live until Ctrl-C.");
-                        ready.0.lock().unwrap().failure = Some(reason);
-                        ready.1.notify_all();
+                        retain_lobby(&ready, reason);
                     }
                 }
             }
             gst::MessageView::Error(_) => {
                 let failure = bus_error(&message).unwrap();
-                let from_movie = message
-                    .src()
-                    .is_some_and(|source| source.has_as_ancestor(&parts.movie));
-                if from_movie && !switched.load(Ordering::Acquire) {
-                    eprintln!(
-                        "Movie decoder stopped before handoff; the lobby will remain live until Ctrl-C.\n{failure}"
-                    );
-                    ready.0.lock().unwrap().failure = Some(failure);
-                    ready.1.notify_all();
-                } else {
+                if fatal_pipeline_error(&message, &parts.pipeline, switched.load(Ordering::Acquire))
+                {
                     return Err(error(failure));
                 }
+                retain_lobby(&ready, failure);
             }
             gst::MessageView::Eos(_) => return Ok(()),
             gst::MessageView::Application(application) => {
+                if let Some(failure) = application_failure(&message) {
+                    return Err(error(failure));
+                }
                 let structure = application
                     .structure()
                     .ok_or_else(|| error("Application message has no structure"))?;
-                match structure.name().as_str() {
-                    "owncast-interrupt" => return Ok(()),
-                    "owncast-title-error" => {
-                        return Err(error(
-                            structure
-                                .get::<String>("error")
-                                .unwrap_or_else(|_| "Cannot update Owncast title".into()),
-                        ));
-                    }
-                    _ => {}
+                if structure.name() == "owncast-interrupt" {
+                    return Ok(());
                 }
             }
             _ => {}
@@ -675,6 +896,170 @@ mod tests {
                 is_sdh: false,
             })
         );
+    }
+
+    #[test]
+    fn links_stream_start_that_precedes_selection() {
+        gst::init().unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let selection = Arc::new(OnceLock::new());
+        let video_src = gst::Pad::builder(gst::PadDirection::Src)
+            .name("video-src")
+            .build();
+        let video_sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("video-sink")
+            .build();
+        let audio_sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("audio-sink")
+            .build();
+        let subtitle_sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .name("subtitle-sink")
+            .build();
+        let sinks = SelectedSinks {
+            video: video_sink.clone(),
+            audio: audio_sink,
+            subtitle: subtitle_sink,
+        };
+
+        watch_movie_pad(&video_src, &ready, &selection, &sinks);
+        video_src.set_active(true).unwrap();
+        video_src.push_event(gst::event::StreamStart::new("video"));
+        selection
+            .set(Selection {
+                video_id: "video".into(),
+                audio_id: "audio".into(),
+                subtitle: SubtitleSource::None,
+            })
+            .unwrap();
+        resolve_pending_pads(&ready, &selection, &sinks);
+
+        assert_eq!(video_src.peer(), Some(video_sink));
+        assert!(ready.0.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn keeps_lobby_for_pre_handoff_branch_error() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let movie_branch = gst::ElementFactory::make("fakesrc")
+            .name("movie-branch")
+            .build()
+            .unwrap();
+        let output = gst::ElementFactory::make("fakesink")
+            .name("output")
+            .build()
+            .unwrap();
+        pipeline.add_many([&movie_branch, &output]).unwrap();
+        let branch_error = gst::message::Error::builder(gst::StreamError::Failed, "preroll failed")
+            .src(&movie_branch)
+            .build();
+        let output_error = gst::message::Error::builder(gst::StreamError::Failed, "publish failed")
+            .src(&output)
+            .build();
+
+        assert!(!fatal_pipeline_error(&branch_error, &pipeline, false));
+        assert!(fatal_pipeline_error(&output_error, &pipeline, false));
+        assert!(fatal_pipeline_error(&branch_error, &pipeline, true));
+    }
+
+    #[test]
+    fn selected_pad_link_failure_keeps_lobby() {
+        gst::init().unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let selection = OnceLock::new();
+        selection
+            .set(Selection {
+                video_id: "video".into(),
+                audio_id: "audio".into(),
+                subtitle: SubtitleSource::None,
+            })
+            .unwrap();
+        let video_src = gst::Pad::new(gst::PadDirection::Src);
+        let occupied_sink = gst::Pad::new(gst::PadDirection::Sink);
+        video_src.link(&occupied_sink).unwrap();
+        let sinks = SelectedSinks {
+            video: gst::Pad::new(gst::PadDirection::Sink),
+            audio: gst::Pad::new(gst::PadDirection::Sink),
+            subtitle: gst::Pad::new(gst::PadDirection::Sink),
+        };
+        ready.0.lock().unwrap().pending_pads.push(PendingPad {
+            pad: video_src,
+            stream_id: Some("video".into()),
+        });
+
+        resolve_pending_pads(&ready, &selection, &sinks);
+
+        assert!(
+            ready
+                .0
+                .lock()
+                .unwrap()
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("Cannot link selected stream video"))
+        );
+    }
+
+    #[test]
+    fn records_recoverable_handoff_failure() {
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+
+        retain_lobby(&ready, "subtitle failed");
+
+        assert_eq!(
+            ready.0.lock().unwrap().failure.as_deref(),
+            Some("subtitle failed")
+        );
+    }
+
+    #[test]
+    fn rejects_failed_sigint_registration() {
+        unsafe extern "C" fn reject_registration(
+            _: i32,
+            _: i32,
+            _: unsafe extern "C" fn(*mut c_void) -> i32,
+            _: *mut c_void,
+            _: unsafe extern "C" fn(*mut c_void),
+        ) -> u32 {
+            0
+        }
+
+        gst::init().unwrap();
+        assert!(register_sigint_with(&gst::Bus::new(), reject_registration).is_err());
+    }
+
+    #[test]
+    fn sigint_callback_does_not_panic_when_bus_rejects_message() {
+        gst::init().unwrap();
+        let removed = Arc::new(AtomicBool::new(false));
+        let bus = gst::Bus::new();
+        bus.set_flushing(true);
+        let data = Box::into_raw(Box::new(SignalData {
+            bus,
+            removed: removed.clone(),
+        }))
+        .cast();
+
+        assert_eq!(unsafe { post_interrupt(data) }, 0);
+        assert!(removed.load(Ordering::Acquire));
+        unsafe { drop_signal_bus(data) };
+    }
+
+    #[test]
+    fn surfaces_title_and_clock_application_failures() {
+        gst::init().unwrap();
+        for (name, failure) in [
+            ("owncast-title-error", "title failed"),
+            ("owncast-switch-error", "clock failed"),
+        ] {
+            let message = gst::message::Application::builder(
+                gst::Structure::builder(name)
+                    .field("error", failure)
+                    .build(),
+            )
+            .build();
+            assert_eq!(application_failure(&message).as_deref(), Some(failure));
+        }
     }
 
     #[test]
