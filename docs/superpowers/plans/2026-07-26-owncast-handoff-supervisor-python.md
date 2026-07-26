@@ -215,13 +215,13 @@ re-review. No live command runs until review is clean.
 
 ---
 
-### Task 3: Capture Attempt 10
+### Task 3: Capture Attempt 13
 
 **Files:**
 
 - Execute unchanged: `/var/tmp/attempt6-collector/collector.py`
 - Execute reviewed: `/var/tmp/attempt10-python-supervisor/supervise.py`
-- Create: `/var/tmp/owncast-task5-attempt10-<UTC>/`
+- Create: `/var/tmp/owncast-task5-attempt13-<UTC>/`
 - Create: root-only run-log directory
 - Append: existing ignored Task 5 reports and ledgers
 
@@ -267,7 +267,7 @@ offline entry, auth/health pass, and final offline/helper/collector/RTMP zero.
 Compute segment-0 PDT to Enter upper bound and require it below 15.5 seconds.
 Create and verify the full evidence manifest, seal files `0444` and directories
 `0555`, reject symlinks, seal logs, rerun integrity/repository/host checks, and
-append sanitized Attempt 10 evidence to the reports and ledgers. Do not run a
+append sanitized Attempt 13 evidence to the reports and ledgers. Do not run a
 media validator.
 
 - [ ] **Step 5: Commit only this replacement plan**
