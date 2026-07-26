@@ -55,15 +55,18 @@ pub(crate) fn select_streams(
                 .find(|stream| stream.kind == StreamKind::Audio && stream.is_default)
         })
         .ok_or_else(|| "Movie has no English or default audio stream".to_owned())?;
-    let subtitle = streams
-        .iter()
-        .find(|stream| {
-            stream.kind == StreamKind::Subtitle
-                && matches!(stream.language.as_deref(), Some("eng" | "en"))
-                && !stream.is_sdh
+    let subtitle = external
+        .map(|path| SubtitleSource::External(path.to_owned()))
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|stream| {
+                    stream.kind == StreamKind::Subtitle
+                        && matches!(stream.language.as_deref(), Some("eng" | "en"))
+                        && !stream.is_sdh
+                })
+                .map(|stream| SubtitleSource::Embedded(stream.id.clone()))
         })
-        .map(|stream| SubtitleSource::Embedded(stream.id.clone()))
-        .or_else(|| external.map(|path| SubtitleSource::External(path.to_owned())))
         .unwrap_or(SubtitleSource::None);
 
     Ok(Selection {
@@ -115,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_non_sdh_english_subtitles() {
+    fn explicit_subtitles_override_embedded_english() {
         let mut streams = base();
         let mut sdh = stream("eng-sdh", StreamKind::Subtitle, Some("eng"), true);
         sdh.is_sdh = true;
@@ -130,6 +133,10 @@ mod tests {
             select_streams(&streams, Some(Path::new("fallback.srt")))
                 .unwrap()
                 .subtitle,
+            SubtitleSource::External("fallback.srt".into())
+        );
+        assert_eq!(
+            select_streams(&streams, None).unwrap().subtitle,
             SubtitleSource::Embedded("eng-dialogue".into())
         );
     }
