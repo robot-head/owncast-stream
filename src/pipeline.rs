@@ -757,7 +757,7 @@ fn add_external_subtitles(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let subtitles = gst::parse::bin_from_description_with_name(
-        "filesrc name=source ! subparse ! queue",
+        "filesrc name=source ! subparse ! queue name=subtitle_timing",
         true,
         "movie_external_subtitles",
     )?;
@@ -765,12 +765,16 @@ fn add_external_subtitles(
         .by_name("source")
         .ok_or_else(|| error("External subtitle source is missing"))?
         .set_property("location", path);
+    let timing = subtitles
+        .by_name("subtitle_timing")
+        .and_then(|queue| queue.static_pad("src"))
+        .ok_or_else(|| error("External subtitle timing pad is missing"))?;
+    add_subtitle_timestamp_probe(&timing)
+        .ok_or_else(|| error("Cannot install external subtitle timestamp correction"))?;
     pipeline.add(&subtitles)?;
     let output = subtitles
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?;
-    add_subtitle_timestamp_probe(&output)
-        .ok_or_else(|| error("Cannot install external subtitle timestamp correction"))?;
     output.link(sink)?;
     subtitles.sync_state_with_parent()?;
     Ok(())
@@ -1546,6 +1550,16 @@ mod tests {
         add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
 
         assert!(parts.movie_subtitle_sink.peer().is_some());
+        assert!(
+            parts
+                .pipeline
+                .by_name("movie_external_subtitles")
+                .unwrap()
+                .downcast::<gst::Bin>()
+                .unwrap()
+                .by_name("subtitle_timing")
+                .is_some()
+        );
         fs::remove_file(subtitle).unwrap();
     }
 
