@@ -19,8 +19,9 @@ use crate::{
     set_title,
 };
 
-fn running_time_offset(boundary: gst::ClockTime, first_pts: gst::ClockTime) -> i64 {
-    boundary.nseconds() as i64 - first_pts.nseconds() as i64
+fn rebase_timestamp(timestamp: u64, boundary: u64, first_pts: u64) -> Result<u64, String> {
+    let rebased = i128::from(timestamp) + i128::from(boundary) - i128::from(first_pts);
+    u64::try_from(rebased).map_err(|_| "Movie timestamp rebase is out of range".to_owned())
 }
 
 fn bus_error(message: &gst::MessageRef) -> Option<String> {
@@ -385,10 +386,18 @@ impl Drop for PipelineParts {
 struct ReadyState {
     video_pts: Option<gst::ClockTime>,
     audio_pts: Option<gst::ClockTime>,
+    video_rebase: Option<TimestampRebase>,
+    audio_rebase: Option<TimestampRebase>,
     enter_pressed: bool,
     failure: Option<String>,
     pending_pads: Vec<PendingPad>,
     blocking_probes: Option<BlockingProbes>,
+}
+
+#[derive(Clone, Copy)]
+struct TimestampRebase {
+    boundary: u64,
+    first_pts: u64,
 }
 
 struct PendingPad {
@@ -563,6 +572,80 @@ fn block_first_buffer(
             gst::PadProbeReturn::Ok
         },
     )
+}
+
+fn configure_timestamp_rebase(
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    boundary: gst::ClockTime,
+) -> Result<(), String> {
+    let mut state = ready.0.lock().unwrap();
+    let video_pts = state
+        .video_pts
+        .ok_or_else(|| "Movie video timestamp is missing".to_owned())?;
+    let audio_pts = state
+        .audio_pts
+        .ok_or_else(|| "Movie audio timestamp is missing".to_owned())?;
+    state.video_rebase = Some(TimestampRebase {
+        boundary: boundary.nseconds(),
+        first_pts: video_pts.nseconds(),
+    });
+    state.audio_rebase = Some(TimestampRebase {
+        boundary: boundary.nseconds(),
+        first_pts: audio_pts.nseconds(),
+    });
+    Ok(())
+}
+
+fn add_timestamp_rebase_probe(
+    pad: &gst::Pad,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    bus: &gst::Bus,
+    video: bool,
+) -> Option<gst::PadProbeId> {
+    let ready = ready.clone();
+    let bus = bus.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let timing = {
+            let state = ready.0.lock().unwrap();
+            if video {
+                state.video_rebase
+            } else {
+                state.audio_rebase
+            }
+        };
+        let result = (|| {
+            let timing =
+                timing.ok_or_else(|| "Movie timestamp rebase is not configured".to_owned())?;
+            let buffer = info
+                .buffer_mut()
+                .ok_or_else(|| "Movie timestamp probe received no buffer".to_owned())?;
+            let pts = buffer
+                .pts()
+                .map(|pts| {
+                    rebase_timestamp(pts.nseconds(), timing.boundary, timing.first_pts)
+                        .map(gst::ClockTime::from_nseconds)
+                })
+                .transpose()?;
+            let dts = buffer
+                .dts()
+                .map(|dts| {
+                    rebase_timestamp(dts.nseconds(), timing.boundary, timing.first_pts)
+                        .map(gst::ClockTime::from_nseconds)
+                })
+                .transpose()?;
+            let buffer = buffer.make_mut();
+            buffer.set_pts(pts);
+            buffer.set_dts(dts);
+            Ok::<(), String>(())
+        })();
+        match result {
+            Ok(()) => gst::PadProbeReturn::Ok,
+            Err(failure) => {
+                post_application_error(&bus, "owncast-switch-error", failure);
+                gst::PadProbeReturn::Drop
+            }
+        }
+    })
 }
 
 struct BlockingProbes {
@@ -796,6 +879,10 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| error("Cannot block movie video"))?;
     let audio_probe = block_first_buffer(&parts.movie_audio_src, &ready, false)
         .ok_or_else(|| error("Cannot block movie audio"))?;
+    let _video_rebase = add_timestamp_rebase_probe(&parts.movie_video_src, &ready, &bus, true)
+        .ok_or_else(|| error("Cannot rebase movie video timestamps"))?;
+    let _audio_rebase = add_timestamp_rebase_probe(&parts.movie_audio_src, &ready, &bus, false)
+        .ok_or_else(|| error("Cannot rebase movie audio timestamps"))?;
     ready.0.lock().unwrap().blocking_probes = Some(BlockingProbes {
         video: Some((parts.movie_video_src.clone(), video_probe)),
         audio: Some((parts.movie_audio_src.clone(), audio_probe)),
@@ -853,8 +940,6 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
             release_blocking_probes(&switch_ready);
             return;
         }
-        let video_pts = state.video_pts.unwrap();
-        let audio_pts = state.audio_pts.unwrap();
         drop(state);
 
         let (clock, base_time) = match pipeline_timing(&switch_pipeline) {
@@ -866,8 +951,11 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
             }
         };
         let boundary = next_frame_boundary(clock.time().saturating_sub(base_time));
-        movie_video_pad.set_offset(running_time_offset(boundary, video_pts));
-        movie_audio_pad.set_offset(running_time_offset(boundary, audio_pts));
+        if let Err(failure) = configure_timestamp_rebase(&switch_ready, boundary) {
+            release_blocking_probes(&switch_ready);
+            post_application_error(&switch_bus, "owncast-switch-error", failure);
+            return;
+        }
         let clock_id = clock.new_single_shot_id(base_time + boundary);
         let callback_bus = switch_bus.clone();
         schedule_clock_callback(
@@ -1023,6 +1111,223 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rebase_probe_rewrites_every_movie_pts_and_dts_after_block_release() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let bus = pipeline.bus().unwrap();
+        let source = gst::Pad::new(gst::PadDirection::Src);
+        let (buffer_tx, buffer_rx) = mpsc::channel();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .chain_function(move |_, _, buffer| {
+                buffer_tx
+                    .send((buffer.pts(), buffer.dts(), buffer.duration()))
+                    .unwrap();
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build();
+        source.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        source.link(&sink).unwrap();
+        source.push_event(gst::event::StreamStart::new("movie"));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        source.push_event(gst::event::Segment::new(segment.as_ref()));
+
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let blocker = block_first_buffer(&source, &ready, true).unwrap();
+        let _rebase = add_timestamp_rebase_probe(&source, &ready, &bus, true).unwrap();
+        let push_source = source.clone();
+        std::thread::spawn(move || {
+            for second in [0, 1] {
+                let mut buffer = gst::Buffer::new();
+                {
+                    let buffer = buffer.get_mut().unwrap();
+                    buffer.set_pts(gst::ClockTime::from_seconds(second));
+                    buffer.set_dts(gst::ClockTime::from_mseconds(second * 1_000 + 900));
+                    buffer.set_duration(gst::ClockTime::from_mseconds(20));
+                }
+                assert!(push_source.push(buffer).is_ok());
+            }
+        });
+
+        let mut state = ready
+            .1
+            .wait_timeout_while(ready.0.lock().unwrap(), Duration::from_secs(1), |state| {
+                state.video_pts.is_none()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(state.video_pts, Some(gst::ClockTime::ZERO));
+        state.audio_pts = Some(gst::ClockTime::ZERO);
+        drop(state);
+        configure_timestamp_rebase(&ready, gst::ClockTime::from_seconds(30)).unwrap();
+        source.remove_probe(blocker);
+
+        assert_eq!(
+            buffer_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (
+                Some(gst::ClockTime::from_seconds(30)),
+                Some(gst::ClockTime::from_mseconds(30_900)),
+                Some(gst::ClockTime::from_mseconds(20)),
+            )
+        );
+        assert_eq!(
+            buffer_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (
+                Some(gst::ClockTime::from_seconds(31)),
+                Some(gst::ClockTime::from_mseconds(31_900)),
+                Some(gst::ClockTime::from_mseconds(20)),
+            )
+        );
+    }
+
+    #[test]
+    fn timestamp_rebase_rejects_underflow_and_overflow() {
+        assert!(rebase_timestamp(0, 0, 1).is_err());
+        assert!(rebase_timestamp(u64::MAX, 1, 0).is_err());
+    }
+
+    #[test]
+    fn timestamp_rebase_requires_both_first_timestamps() {
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        assert_eq!(
+            configure_timestamp_rebase(&ready, gst::ClockTime::ZERO).unwrap_err(),
+            "Movie video timestamp is missing"
+        );
+        ready.0.lock().unwrap().video_pts = Some(gst::ClockTime::ZERO);
+        assert_eq!(
+            configure_timestamp_rebase(&ready, gst::ClockTime::ZERO).unwrap_err(),
+            "Movie audio timestamp is missing"
+        );
+    }
+
+    #[test]
+    fn audio_encoder_and_parser_stay_monotonic_across_handoff() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            r#"
+            audiotestsrc is-live=true wave=silence
+              ! audio/x-raw,format=F32LE,rate=48000,channels=2
+              ! selector.sink_0
+            appsrc name=movie is-live=true block=true format=time
+                caps=audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2
+              ! queue name=movie_branch
+              ! selector.sink_1
+            input-selector name=selector sync-streams=true sync-mode=clock
+                cache-buffers=true drop-backwards=true
+              ! audioconvert
+              ! audioresample
+              ! audio/x-raw,format=F32LE,rate=48000,channels=2
+              ! audiocheblimit mode=high-pass cutoff=80 poles=4
+              ! audiodynamic mode=compressor characteristics=soft-knee
+                  threshold=0.125 ratio=2.0
+              ! avenc_aac name=audio_encoder bitrate=192000
+              ! aacparse name=audio_parser
+              ! fakesink sync=false
+            "#,
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let selector = pipeline.by_name("selector").unwrap();
+        selector.set_property("active-pad", Some(&selector.static_pad("sink_0").unwrap()));
+        let movie_pad = pipeline
+            .by_name("movie_branch")
+            .unwrap()
+            .static_pad("src")
+            .unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let blocker = block_first_buffer(&movie_pad, &ready, false).unwrap();
+        let _rebase =
+            add_timestamp_rebase_probe(&movie_pad, &ready, &pipeline.bus().unwrap(), false)
+                .unwrap();
+
+        let (raw_tx, raw_rx) = mpsc::channel();
+        pipeline
+            .by_name("audio_encoder")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(pts) = info.buffer().and_then(|buffer| buffer.pts()) {
+                    raw_tx.send(pts).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        let (encoded_tx, encoded_rx) = mpsc::channel();
+        pipeline
+            .by_name("audio_parser")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(pts) = info.buffer().and_then(|buffer| buffer.pts()) {
+                    encoded_tx.send(pts).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut raw = vec![raw_rx.recv_timeout(Duration::from_secs(2)).unwrap()];
+        let mut encoded = vec![encoded_rx.recv_timeout(Duration::from_secs(2)).unwrap()];
+        let movie = pipeline.by_name("movie").unwrap();
+        let push = std::thread::spawn(move || {
+            const FRAMES: usize = 1024;
+            for block in 0..12 {
+                let mut buffer = gst::Buffer::with_size(FRAMES * 2 * size_of::<f32>()).unwrap();
+                {
+                    let buffer = buffer.get_mut().unwrap();
+                    buffer.set_pts(gst::ClockTime::from_nseconds(
+                        block * FRAMES as u64 * 1_000_000_000 / 48_000,
+                    ));
+                    buffer.set_dts(buffer.pts());
+                    buffer.set_duration(gst::ClockTime::from_nseconds(
+                        FRAMES as u64 * 1_000_000_000 / 48_000,
+                    ));
+                }
+                push_buffer(&movie, buffer);
+            }
+        });
+
+        let mut state = ready
+            .1
+            .wait_timeout_while(ready.0.lock().unwrap(), Duration::from_secs(2), |state| {
+                state.audio_pts.is_none()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(state.audio_pts, Some(gst::ClockTime::ZERO));
+        state.video_pts = Some(gst::ClockTime::ZERO);
+        drop(state);
+        let (clock, base_time) = pipeline_timing(&pipeline).unwrap();
+        let boundary = next_frame_boundary(
+            clock.time().saturating_sub(base_time) + gst::ClockTime::from_mseconds(100),
+        );
+        configure_timestamp_rebase(&ready, boundary).unwrap();
+        selector.set_property("active-pad", Some(&selector.static_pad("sink_1").unwrap()));
+        movie_pad.remove_probe(blocker);
+        push.join().unwrap();
+
+        while raw.iter().filter(|pts| **pts >= boundary).count() < 4 {
+            raw.push(raw_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        while encoded.iter().filter(|pts| **pts >= boundary).count() < 4 {
+            encoded.push(encoded_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert!(raw.windows(2).all(|pair| pair[0] < pair[1]), "{raw:?}");
+        assert!(
+            encoded.windows(2).all(|pair| pair[0] < pair[1]),
+            "{encoded:?}"
+        );
+        let raw_first = raw.into_iter().find(|pts| *pts >= boundary).unwrap();
+        let encoded_first = encoded.into_iter().find(|pts| *pts >= boundary).unwrap();
+        assert!(raw_first.nseconds().abs_diff(encoded_first.nseconds()) <= 50_000_000);
+    }
+
     fn stream_collection_message(movie: &gst::Element) -> gst::Message {
         let collection = gst::StreamCollection::builder(None)
             .streams([
@@ -1046,13 +1351,10 @@ mod tests {
     }
 
     #[test]
-    fn rebases_first_movie_pts_to_boundary() {
+    fn rebases_timestamp_to_boundary() {
         assert_eq!(
-            running_time_offset(
-                gst::ClockTime::from_seconds(30),
-                gst::ClockTime::from_mseconds(250)
-            ),
-            29_750_000_000
+            rebase_timestamp(250_000_000, 30_000_000_000, 250_000_000).unwrap(),
+            30_000_000_000
         );
     }
 
@@ -1858,6 +2160,17 @@ mod tests {
                 gst::PadProbeReturn::Ok
             })
             .unwrap();
+        let rebase_ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        {
+            let mut state = rebase_ready.0.lock().unwrap();
+            state.video_pts = Some(gst::ClockTime::ZERO);
+            state.audio_pts = Some(gst::ClockTime::ZERO);
+        }
+        let bus = parts.pipeline.bus().unwrap();
+        let _video_rebase =
+            add_timestamp_rebase_probe(&parts.movie_video_src, &rebase_ready, &bus, true).unwrap();
+        let _audio_rebase =
+            add_timestamp_rebase_probe(&parts.movie_audio_src, &rebase_ready, &bus, false).unwrap();
 
         parts.pipeline.set_state(gst::State::Playing).unwrap();
         for _ in 0..2 {
@@ -1865,8 +2178,7 @@ mod tests {
         }
         let (clock, base_time) = pipeline_timing(&parts.pipeline).unwrap();
         let boundary = next_frame_boundary(clock.time() - base_time);
-        parts.movie_video_src.set_offset(boundary.nseconds() as i64);
-        parts.movie_audio_src.set_offset(boundary.nseconds() as i64);
+        configure_timestamp_rebase(&rebase_ready, boundary).unwrap();
         parts
             .video_selector
             .set_property("active-pad", Some(&parts.movie_video_pad));
