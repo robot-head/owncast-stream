@@ -353,7 +353,6 @@ impl PipelineParts {
         let subtitle_overlay = video_bin
             .by_name("movie_subtitles")
             .ok_or_else(|| error("Subtitle overlay is missing"))?;
-        subtitle_overlay.set_property("subtitle-ts-offset", SUBTITLE_TS_OFFSET_NS);
 
         Ok(Self {
             pipeline,
@@ -767,10 +766,11 @@ fn add_external_subtitles(
         .ok_or_else(|| error("External subtitle source is missing"))?
         .set_property("location", path);
     pipeline.add(&subtitles)?;
-    subtitles
+    let output = subtitles
         .static_pad("src")
-        .ok_or_else(|| error("External subtitle output is missing"))?
-        .link(sink)?;
+        .ok_or_else(|| error("External subtitle output is missing"))?;
+    output.set_offset(SUBTITLE_TS_OFFSET_NS);
+    output.link(sink)?;
     subtitles.sync_state_with_parent()?;
     Ok(())
 }
@@ -1526,7 +1526,10 @@ mod tests {
         assert!(parts.movie_subtitle_sink.peer().is_none());
         add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
 
-        assert!(parts.movie_subtitle_sink.peer().is_some());
+        assert_eq!(
+            parts.movie_subtitle_sink.peer().unwrap().offset(),
+            SUBTITLE_TS_OFFSET_NS
+        );
         fs::remove_file(subtitle).unwrap();
     }
 
@@ -2049,24 +2052,6 @@ mod tests {
             .state(gst::ClockTime::from_seconds(10))
             .0
             .unwrap();
-    }
-
-    #[test]
-    fn subtitle_overlay_compensates_retained_latency() {
-        let _gst = gst_test();
-        let config = Config {
-            video: PathBuf::from("/tmp/movie.mkv"),
-            subtitles: None,
-            title: String::new(),
-            stream_key: String::new(),
-            title_token: String::new(),
-        };
-        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
-
-        assert_eq!(
-            parts.subtitle_overlay.property::<i64>("subtitle-ts-offset"),
-            SUBTITLE_TS_OFFSET_NS
-        );
     }
 
     fn appsrc(name: &str, caps: gst::Caps) -> gst::Element {
