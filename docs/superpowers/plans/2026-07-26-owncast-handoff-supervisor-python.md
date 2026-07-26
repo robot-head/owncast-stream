@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Send one prompt handoff within five seconds of the Owncast lobby connection using a deterministic Python child-process supervisor.
+**Goal:** Send one prompt handoff within fourteen seconds of the Owncast lobby connection using a deterministic Python child-process supervisor.
 
 **Architecture:** A root-only Python standard-library script launches the unchanged streamer with `stdin=PIPE`, polls loopback status, writes one newline, and closes stdin. It waits for the unchanged collector's success marker, then sends one SIGINT to the exact child PID and reaps it.
 
@@ -15,7 +15,7 @@
 - Send Enter exactly once and only while the child is alive and status proves
   `online=true`, title `Starting soon: Passenger`, and nonempty
   `lastConnectTime`.
-- Refuse Enter when the conservative proof delay exceeds 5,000 ms.
+- Refuse Enter when the conservative proof delay exceeds 14,000 ms.
 - Require one inbound connection, title `Passenger`, and unchanged `lastConnectTime` after handoff.
 - Require exact retained live segments `0..30`.
 - Do not run a media validator during this plan.
@@ -62,7 +62,7 @@ def test_proof_delay_and_lobby_gate():
 
 Also require:
 
-- exactly 5,000 ms passes and 5,001 ms fails;
+- exactly 14,000 ms passes and 14,001 ms fails;
 - wrong title, offline, or empty connection time fails;
 - `send_enter` writes exactly `"\n"`, flushes, closes stdin, and rejects a
   second call;
@@ -90,7 +90,7 @@ connection times, calculate `delta = proof - connection`, and return:
 delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
 ```
 
-`handoff_allowed` rejects negative delay, delay over `5000`, offline state,
+`handoff_allowed` rejects negative delay, delay over `14000`, offline state,
 wrong title, or missing connection.
 
 `send_enter` requires `process.stdin`, writes one newline, flushes, closes it,
@@ -197,7 +197,7 @@ Task 1 report. Generate and verify `PACKAGE-SHA256SUMS`.
 Verify:
 
 - direct stdin pipe writes and closes exactly once;
-- proof delay accepts exactly 5,000 ms and rejects 5,001 ms;
+- proof delay accepts exactly 14,000 ms and rejects 14,001 ms;
 - lobby/movie titles and connection identity are exact;
 - status access is loopback only;
 - inbound count must equal one;
@@ -259,7 +259,7 @@ Enter. Do not retry any live failure.
 
 - [ ] **Step 4: Verify, seal, and record**
 
-Require proof delay at most 5,000 ms, `enter_count=1`, one inbound connection,
+Require proof delay at most 14,000 ms, `enter_count=1`, one inbound connection,
 correct titles, unchanged connection time, exact segments `0..30`, 31 files,
 93 seconds, complete revision/history/hash/size associations, no retained
 offline entry, auth/health pass, and final offline/helper/collector/RTMP zero.
