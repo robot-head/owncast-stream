@@ -398,6 +398,7 @@ struct ReadyState {
     failure: Option<String>,
     pending_pads: Vec<PendingPad>,
     blocking_probes: Option<BlockingProbes>,
+    adjusted_subtitles: Option<AdjustedSubtitles>,
 }
 
 #[derive(Clone, Copy)]
@@ -758,7 +759,7 @@ fn add_external_subtitles(
     pipeline: &gst::Pipeline,
     sink: &gst::Pad,
     path: &std::path::Path,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<AdjustedSubtitles, Box<dyn Error>> {
     let contents = advance_srt(&std::fs::read_to_string(path)?).map_err(error)?;
     let adjusted = write_adjusted_subtitles(&contents)?;
     let subtitles = gst::parse::bin_from_description_with_name(
@@ -776,7 +777,7 @@ fn add_external_subtitles(
         .ok_or_else(|| error("External subtitle output is missing"))?;
     output.link(sink)?;
     subtitles.sync_state_with_parent()?;
-    Ok(())
+    Ok(adjusted)
 }
 
 static SUBTITLE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -882,12 +883,15 @@ fn configure_movie_streams(
     };
     match &chosen.subtitle {
         SubtitleSource::External(path) => {
-            if let Err(failure) = add_external_subtitles(pipeline, &sinks.subtitle, path) {
-                retain_lobby(
-                    ready,
-                    format!("Cannot prepare external subtitles: {failure}"),
-                );
-                return;
+            match add_external_subtitles(pipeline, &sinks.subtitle, path) {
+                Ok(adjusted) => ready.0.lock().unwrap().adjusted_subtitles = Some(adjusted),
+                Err(failure) => {
+                    retain_lobby(
+                        ready,
+                        format!("Cannot prepare external subtitles: {failure}"),
+                    );
+                    return;
+                }
             }
         }
         SubtitleSource::None => overlay.set_property("silent", true),
