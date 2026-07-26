@@ -26,12 +26,12 @@ The supervisor:
    closes stdin, and rejects any second send;
 6. waits for API title `Passenger`, unchanged `lastConnectTime`, exactly one
    inbound connection, and a still-running child;
-7. polls the expected fresh evidence path for the collector's root-owned,
-   regular `capture-status.txt` success marker;
+7. polls the explicit fresh marker path for the collector's root-owned,
+   regular `capture-status.txt`;
 8. forwards one SIGINT to the streamer, waits with a bounded timeout, and
    verifies clean exit without signaling any other process.
 
-The evidence path is an explicit supervisor argument and must not exist before
+The marker path is an explicit supervisor argument and must not exist before
 the collector starts. Any failed precondition, timeout, unsafe success marker,
 title mismatch, reconnect, or duplicate handoff stops the streamer safely and
 produces no successful capture claim.

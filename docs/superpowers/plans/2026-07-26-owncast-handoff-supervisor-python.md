@@ -34,7 +34,7 @@
 
 **Interfaces:**
 
-- CLI: `supervise.py EVIDENCE_PATH RUN_LOG_DIR`
+- CLI: `supervise.py CAPTURE_MARKER RUN_LOG_DIR`
 - Pure helper: `proof_delay_ms(last_connect: str, proof: datetime) -> int`
 - Pure helper: `handoff_allowed(status: dict, proof: datetime) -> tuple[str, int]`
 - Side effect: `send_enter(process: subprocess.Popen, already_sent: bool) -> bool`
@@ -250,7 +250,7 @@ mode `0600` and exact `capture=PASS\n` only after collector exit zero.
 ```bash
 sudo python3 \
   /var/tmp/attempt10-python-supervisor/supervise.py \
-  "$evidence_path" "$run_log_dir"
+  "$evidence_path/capture-status.txt" "$run_log_dir"
 ```
 
 Rely on the supervisor's reviewed internal phase deadlines and bounded cleanup;
