@@ -1337,6 +1337,10 @@ mod tests {
             .0
             .expect("audio handoff pipeline did not reach Null within 10s");
 
+        assert!(
+            encoded.iter().any(|pts| *pts < boundary),
+            "parser emitted no lobby buffer before {boundary:?}: {encoded:?}"
+        );
         assert!(raw.windows(2).all(|pair| pair[0] < pair[1]), "{raw:?}");
         assert!(
             encoded.windows(2).all(|pair| pair[0] < pair[1]),
