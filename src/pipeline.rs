@@ -1010,6 +1010,10 @@ mod tests {
             .0;
         assert_eq!(state.video_pts, Some(gst::ClockTime::from_seconds(7)));
         drop(state);
+        assert!(matches!(
+            flow_rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
         source.remove_probe(probe);
         assert!(
             flow_rx
