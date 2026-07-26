@@ -146,8 +146,8 @@ Capture complete commands, output, and statuses in `refactor-green.log`.
 **Interfaces:**
 
 - Consumes: `build_video_branch(&VideoRequest)`.
-- Produces: a video branch with explicit `video_sink` ghost pad and an
-  independently linkable `subtitleoverlay.subtitle_sink`.
+- Produces: a video branch with explicit `video_sink` and `subtitle_sink`
+  ghost pads.
 
 - [ ] **Step 1: Write the non-decoder regression test**
 
@@ -156,7 +156,8 @@ Add this test to the existing test module:
 ```rust
 #[test]
 fn subtitle_video_branch_has_independent_inputs() {
-    let _gst = gst_test();
+    gst::init().unwrap();
+    let pipeline = gst::Pipeline::new();
     let request = VideoRequest {
         start_ns: 0,
         end_ns: 1,
@@ -166,16 +167,15 @@ fn subtitle_video_branch_has_independent_inputs() {
         subtitle: Some(PathBuf::from("unused.srt")),
     };
     let branch = build_video_branch(&request).unwrap();
-    let subtitle_source = gst::Pad::new(gst::PadDirection::Src);
+    let subtitle_source = gst::ElementFactory::make("fakesrc").build().unwrap();
+    pipeline
+        .add_many([branch.upcast_ref(), &subtitle_source])
+        .unwrap();
 
     subtitle_source
-        .link(
-            &branch
-                .by_name("overlay")
-                .unwrap()
-                .static_pad("subtitle_sink")
-                .unwrap(),
-        )
+        .static_pad("src")
+        .unwrap()
+        .link(&branch.static_pad("subtitle_sink").unwrap())
         .unwrap();
     assert_eq!(
         branch.static_pad("video_sink").unwrap().direction(),
@@ -192,8 +192,9 @@ cargo test --offline subtitle_video_branch_has_independent_inputs
 ```
 
 Expected: fail because the current automatically ghosted branch does not
-provide the explicit `video_sink`, or because the underlying subtitle sink is
-already linked. Capture the complete result in `pad-wiring-red.log`.
+provide both named inputs. Preserve the initial direct-link RED containing
+`WasLinked` and the revised named-input RED. Capture the complete results in
+`pad-wiring-red.log` and `pad-wiring-red-two-pads.log`.
 
 - [ ] **Step 3: Implement the minimal explicit-pad repair**
 
@@ -217,9 +218,12 @@ let video_sink = gst::GhostPad::builder_with_target(
 branch.add_pad(&video_sink)?;
 ```
 
+4. create a second ghost pad named `subtitle_sink` targeting
+   `overlay.subtitle_sink` when subtitles are requested.
+
 In `decode_video`, link the selected video pad to
-`branch.static_pad("video_sink")`. Keep the direct subtitle-parser link
-unchanged.
+`branch.static_pad("video_sink")` and the subtitle parser to
+`branch.static_pad("subtitle_sink")`.
 
 - [ ] **Step 4: Verify GREEN and all non-decoder gates**
 
@@ -276,8 +280,9 @@ Require the review to prove:
 - evidence digests, thresholds, source windows, classifiers, adapter,
   continuity code, and `run_real` are unchanged;
 - the behavioral refactor only extracts existing construction;
-- the repair only names the input queue, disables automatic ghosting, adds the
-  explicit video ghost pad, and selects that pad in `decode_video`;
+- the repair only names the input queue, disables automatic ghosting, adds
+  explicit video/subtitle ghost pads, and selects those bin-boundary pads in
+  `decode_video`;
 - the new test performs no media decode;
 - exactly the two approved decoder tests remain omitted;
 - all candidate and package hashes verify.

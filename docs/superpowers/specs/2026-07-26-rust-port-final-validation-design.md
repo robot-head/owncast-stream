@@ -33,21 +33,23 @@ Replace the validator's ambiguous automatic sink ghosting with explicit pad
 ownership:
 
 1. parse the video branch without automatic ghost pads;
-2. name the input queue and add one explicit bin ghost pad targeting its sink;
-3. continue linking the subtitle parser directly to
-   `subtitleoverlay.subtitle_sink`.
+2. name the input queue and add an explicit `video_sink` bin ghost pad
+   targeting its sink;
+3. add an explicit `subtitle_sink` bin ghost pad targeting
+   `subtitleoverlay.subtitle_sink`;
+4. link the subtitle parser to the bin's `subtitle_sink`.
 
 This is the smallest deterministic repair and mirrors the explicit video-pad
-pattern already used by the production Rust pipeline. It avoids depending on
-which of two unlinked sink pads GStreamer chooses to ghost.
+pattern already used by the production Rust pipeline. Both external sources
+now link at the bin boundary, avoiding automatic-pad ambiguity and
+cross-hierarchy direct links.
 
 ## Test-first gate
 
 Before changing the validator, add one non-decoder wiring test that constructs
-the subtitle-enabled branch and proves the subtitle sink is free while the
-explicit video ghost pad exists. Require it to fail against the current
-automatic-ghost implementation with `WasLinked`, then pass after the minimal
-repair.
+the subtitle-enabled branch and proves its explicit video and subtitle inputs
+link independently. Require it to fail against the current automatic-ghost
+implementation with `WasLinked`, then pass after the minimal repair.
 
 Run formatting, Clippy, release build, selfcheck, and all existing non-media
 tests while continuing to skip exactly:
