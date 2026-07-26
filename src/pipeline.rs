@@ -613,19 +613,22 @@ fn pipeline_timing(pipeline: &gst::Pipeline) -> Result<(gst::Clock, gst::ClockTi
     require_timing(pipeline.clock(), pipeline.base_time())
 }
 
-fn schedule_clock_callback<F>(
+fn schedule_clock_callback<F, G>(
     clock_id: &gst::SingleShotClockId,
     bus: &gst::Bus,
     ready: &Arc<(Mutex<ReadyState>, Condvar)>,
     callback: F,
+    after_release: G,
 ) -> bool
 where
     F: FnOnce(&gst::Clock, Option<gst::ClockTime>, &gst::ClockId) + Send + 'static,
+    G: FnOnce() + Send + 'static,
 {
     let callback_ready = ready.clone();
     match clock_id.wait_async(move |clock, jitter, id| {
         callback(clock, jitter, id);
         release_blocking_probes(&callback_ready);
+        after_release();
     }) {
         Ok(_) => true,
         Err(failure) => {
@@ -870,16 +873,23 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         movie_audio_pad.set_offset(running_time_offset(boundary, audio_pts));
         let clock_id = clock.new_single_shot_id(base_time + boundary);
         let callback_bus = switch_bus.clone();
-        schedule_clock_callback(&clock_id, &switch_bus, &switch_ready, move |_, _, _| {
-            video_selector.set_property("active-pad", Some(&movie_video_pad));
-            audio_selector.set_property("active-pad", Some(&movie_audio_pad));
-            switch_flag.store(true, Ordering::Release);
-            if let Err(failure) = set_title(&title_token, &title) {
-                post_application_error(&callback_bus, "owncast-title-error", failure);
-                return;
-            }
-            println!("Movie is live.");
-        });
+        schedule_clock_callback(
+            &clock_id,
+            &switch_bus,
+            &switch_ready,
+            move |_, _, _| {
+                video_selector.set_property("active-pad", Some(&movie_video_pad));
+                audio_selector.set_property("active-pad", Some(&movie_audio_pad));
+            },
+            move || {
+                switch_flag.store(true, Ordering::Release);
+                if let Err(failure) = set_title(&title_token, &title) {
+                    post_application_error(&callback_bus, "owncast-title-error", failure);
+                    return;
+                }
+                println!("Movie is live.");
+            },
+        );
     });
 
     let _signal = register_sigint(&bus)?;
@@ -1287,7 +1297,8 @@ mod tests {
             &clock_id,
             &bus,
             &ready,
-            |_, _, _| {}
+            |_, _, _| {},
+            || {},
         ));
         let failure = bus.timed_pop(gst::ClockTime::ZERO).unwrap();
         assert!(
@@ -1309,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_clock_callback_switches_both_selectors_before_releasing_probes() {
+    fn successful_clock_callback_switches_releases_probes_then_runs_title_work() {
         gst::init().unwrap();
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
@@ -1364,6 +1375,8 @@ mod tests {
         let movie_video_pad = parts.movie_video_pad.clone();
         let movie_audio_pad = parts.movie_audio_pad.clone();
         let (order_tx, order_rx) = mpsc::channel();
+        let title_ready = ready.clone();
+        let (title_tx, title_rx) = mpsc::channel();
         assert!(schedule_clock_callback(
             &clock_id,
             &gst::Bus::new(),
@@ -1377,7 +1390,12 @@ mod tests {
                 order_tx
                     .send((video_was_blocked, audio_was_blocked, both_were_blocked))
                     .unwrap();
-            }
+            },
+            move || {
+                title_tx
+                    .send(title_ready.0.lock().unwrap().blocking_probes.is_some())
+                    .unwrap();
+            },
         ));
 
         let (video_was_blocked, audio_was_blocked, both_were_blocked) =
@@ -1386,6 +1404,8 @@ mod tests {
             video_was_blocked && audio_was_blocked && both_were_blocked,
             "both selector assignments must precede probe release"
         );
+        let title_was_blocked = title_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!title_was_blocked, "probe release must precede title work");
         assert!(
             flow_rx
                 .recv_timeout(Duration::from_secs(1))
