@@ -19,6 +19,8 @@ use crate::{
     set_title,
 };
 
+const SUBTITLE_TS_OFFSET_NS: i64 = -100_000_000;
+
 fn rebase_timestamp(timestamp: u64, boundary: u64, first_pts: u64) -> Result<u64, String> {
     let rebased = i128::from(timestamp) + i128::from(boundary) - i128::from(first_pts);
     u64::try_from(rebased).map_err(|_| "Movie timestamp rebase is out of range".to_owned())
@@ -348,6 +350,10 @@ impl PipelineParts {
             .link(&audio_movie_pad)?;
         video_selector.set_property("active-pad", Some(&video_lobby_pad));
         audio_selector.set_property("active-pad", Some(&audio_lobby_pad));
+        let subtitle_overlay = video_bin
+            .by_name("movie_subtitles")
+            .ok_or_else(|| error("Subtitle overlay is missing"))?;
+        subtitle_overlay.set_property("subtitle-ts-offset", SUBTITLE_TS_OFFSET_NS);
 
         Ok(Self {
             pipeline,
@@ -369,9 +375,7 @@ impl PipelineParts {
             movie_audio_src: audio_bin
                 .static_pad("src")
                 .ok_or_else(|| error("Movie audio output is missing"))?,
-            subtitle_overlay: video_bin
-                .by_name("movie_subtitles")
-                .ok_or_else(|| error("Subtitle overlay is missing"))?,
+            subtitle_overlay,
         })
     }
 }
@@ -2045,6 +2049,24 @@ mod tests {
             .state(gst::ClockTime::from_seconds(10))
             .0
             .unwrap();
+    }
+
+    #[test]
+    fn subtitle_overlay_compensates_retained_latency() {
+        let _gst = gst_test();
+        let config = Config {
+            video: PathBuf::from("/tmp/movie.mkv"),
+            subtitles: None,
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
+
+        assert_eq!(
+            parts.subtitle_overlay.property::<i64>("subtitle-ts-offset"),
+            SUBTITLE_TS_OFFSET_NS
+        );
     }
 
     fn appsrc(name: &str, caps: gst::Caps) -> gst::Element {
