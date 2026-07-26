@@ -12,7 +12,9 @@
 
 - Do not modify the production repository source, installed streamer, collector, validator, Owncast, routes, or credentials.
 - Do not print or persist a stream key, title token, password, cookie, or Authorization value.
-- Send Enter exactly once and only after the lobby log line, `online=true`, title `Starting soon: Passenger`, and nonempty `lastConnectTime`.
+- Send Enter exactly once and only while the child is alive and status proves
+  `online=true`, title `Starting soon: Passenger`, and nonempty
+  `lastConnectTime`.
 - Refuse Enter when the conservative proof delay exceeds 5,000 ms.
 - Require one inbound connection, title `Passenger`, and unchanged `lastConnectTime` after handoff.
 - Require exact retained live segments `0..30`.
@@ -34,7 +36,7 @@
 
 - CLI: `supervise.py EVIDENCE_PATH RUN_LOG_DIR`
 - Pure helper: `proof_delay_ms(last_connect: str, proof: datetime) -> int`
-- Pure helper: `handoff_allowed(status: dict, lobby_seen: bool, proof: datetime) -> tuple[str, int]`
+- Pure helper: `handoff_allowed(status: dict, proof: datetime) -> tuple[str, int]`
 - Side effect: `send_enter(process: subprocess.Popen, already_sent: bool) -> bool`
 - Cleanup: `stop_child(process: subprocess.Popen) -> None`
 - Marker: `valid_capture_marker(evidence: Path) -> bool`
@@ -52,7 +54,7 @@ def test_proof_delay_and_lobby_gate():
         "streamTitle": "Starting soon: Passenger",
         "lastConnectTime": "2026-07-26T15:00:00Z",
     }
-    assert supervise.handoff_allowed(status, True, proof) == (
+    assert supervise.handoff_allowed(status, proof) == (
         "2026-07-26T15:00:00Z",
         4500,
     )
@@ -61,7 +63,7 @@ def test_proof_delay_and_lobby_gate():
 Also require:
 
 - exactly 5,000 ms passes and 5,001 ms fails;
-- missing lobby, wrong title, offline, or empty connection time fails;
+- wrong title, offline, or empty connection time fails;
 - `send_enter` writes exactly `"\n"`, flushes, closes stdin, and rejects a
   second call;
 - `valid_capture_marker` accepts only a non-symlink, root-owned regular file
@@ -88,8 +90,8 @@ connection times, calculate `delta = proof - connection`, and return:
 delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
 ```
 
-`handoff_allowed` rejects negative delay, delay over `5000`, missing lobby,
-offline state, wrong title, or missing connection.
+`handoff_allowed` rejects negative delay, delay over `5000`, offline state,
+wrong title, or missing connection.
 
 `send_enter` requires `process.stdin`, writes one newline, flushes, closes it,
 and returns `True`; an already-sent call raises `RuntimeError`.
@@ -99,8 +101,9 @@ and returns `True`; an already-sent call raises `RuntimeError`.
 zero. Test it with a real Python child that prints `READY` only after its
 SIGINT handler is installed.
 
-`valid_capture_marker` uses `lstat`, rejects symlinks/nonregular files,
-requires UID `0`, mode `0600`, and exact marker bytes.
+`valid_capture_marker` opens once with `O_NOFOLLOW|O_NONBLOCK`, validates the
+same descriptor with `fstat`, requires a regular UID-0 mode-0600 file, and
+performs one bounded exact marker read.
 
 - [ ] **Step 4: Implement the live orchestration**
 
@@ -111,9 +114,6 @@ root-owned mode-0700 directories, and no existing marker. Open
 ```python
 process = subprocess.Popen(
     [
-        "/usr/bin/stdbuf",
-        "-oL",
-        "-eL",
         "/usr/local/bin/owncast-stream",
         "/opt/owncast/uploads/Passenger.2026.1080p.ITA-ENG.MULTI.WEBRip.x265.AAC-V3SP4EV3R.mkv",
         "/opt/owncast/uploads/Passenger.2026.1080p.ITA-ENG.MULTI.WEBRip.x265.AAC-V3SP4EV3R.en.srt",
@@ -126,18 +126,15 @@ process = subprocess.Popen(
 )
 ```
 
-`stdbuf` immediately `exec`s the streamer in the same child PID and forces
-line-buffered log output, so proof polling cannot wait on a block-buffered
-file.
+Poll every 100 ms for at most 30 seconds while the child remains alive until
+the fixed no-proxy/no-redirect opener for
+`http://127.0.0.1:8081/api/status` returns the required lobby JSON. Record UTC
+proof time, connection time, delay, and `enter_count=1` to mode-0600
+`supervisor.tsv`, then call `send_enter`.
 
-Poll every 100 ms for at most 30 seconds until the exact lobby line appears
-and `urllib.request.urlopen("http://127.0.0.1:8081/api/status", timeout=1)`
-returns the required JSON. Record UTC proof time, connection time, delay, and
-`enter_count=1` to mode-0600 `supervisor.tsv`, then call `send_enter`.
-
-Poll at most 30 seconds for exact `Movie is live.`, online title `Passenger`,
-unchanged connection time, and exactly one `Inbound stream connected` line
-from:
+Poll at most 30 seconds while the child remains alive for online title
+`Passenger`, unchanged connection time, and exactly one
+`Inbound stream connected` line from:
 
 ```python
 subprocess.run(
@@ -148,6 +145,10 @@ subprocess.run(
     timeout=10,
 )
 ```
+
+Keep `streamer.log` only as diagnostic output. Do not gate either phase on
+Rust stdout lines because redirected Rust stdout may remain buffered until
+shutdown.
 
 Poll at most 190 seconds for `valid_capture_marker(evidence)`, then call
 `stop_child`. In `finally`, if the exact child still runs, send it one SIGINT,
