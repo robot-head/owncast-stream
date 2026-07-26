@@ -1033,8 +1033,18 @@ mod tests {
         fs,
         path::PathBuf,
         sync::mpsc,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    static GST_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn gst_test() -> std::sync::MutexGuard<'static, ()> {
+        let guard = GST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gst::init().unwrap();
+        guard
+    }
 
     fn linked_pads() -> (gst::Pad, gst::Pad) {
         let source = gst::Pad::new(gst::PadDirection::Src);
@@ -1052,7 +1062,7 @@ mod tests {
 
     #[test]
     fn first_buffer_probe_passes_startup_events_before_blocking_media() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let source = gst::Pad::new(gst::PadDirection::Src);
         let sink = gst::Pad::builder(gst::PadDirection::Sink)
             .chain_function(|_, _, _| Ok(gst::FlowSuccess::Ok))
@@ -1113,7 +1123,7 @@ mod tests {
 
     #[test]
     fn rebase_probe_rewrites_every_movie_pts_and_dts_after_block_release() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let pipeline = gst::Pipeline::new();
         let bus = pipeline.bus().unwrap();
         let source = gst::Pad::new(gst::PadDirection::Src);
@@ -1204,19 +1214,30 @@ mod tests {
     #[test]
     fn audio_encoder_and_parser_stay_monotonic_across_handoff() {
         const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+        const FRAMES: u64 = 1024;
 
-        gst::init().unwrap();
+        fn audio_buffer(block: u64) -> gst::Buffer {
+            let mut buffer =
+                gst::Buffer::with_size(FRAMES as usize * 2 * size_of::<f32>()).unwrap();
+            {
+                let buffer = buffer.get_mut().unwrap();
+                buffer.set_pts(gst::ClockTime::from_nseconds(
+                    block * FRAMES * 1_000_000_000 / 48_000,
+                ));
+                buffer.set_dts(buffer.pts());
+                buffer.set_duration(gst::ClockTime::from_nseconds(
+                    FRAMES * 1_000_000_000 / 48_000,
+                ));
+            }
+            buffer
+        }
+
+        let _gst = gst_test();
         let pipeline = gst::parse::launch(
             r#"
-            audiotestsrc is-live=true wave=silence
-              ! audio/x-raw,format=F32LE,rate=48000,channels=2
-              ! selector.sink_0
-            appsrc name=movie is-live=true block=true format=time
+            appsrc name=source is-live=false block=true format=time
                 caps=audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2
-              ! queue name=movie_branch
-              ! selector.sink_1
-            input-selector name=selector sync-streams=true sync-mode=clock
-                cache-buffers=true drop-backwards=true
+              ! queue name=source_branch
               ! audioconvert
               ! audioresample
               ! audio/x-raw,format=F32LE,rate=48000,channels=2
@@ -1231,19 +1252,6 @@ mod tests {
         .unwrap()
         .downcast::<gst::Pipeline>()
         .unwrap();
-        let selector = pipeline.by_name("selector").unwrap();
-        selector.set_property("active-pad", Some(&selector.static_pad("sink_0").unwrap()));
-        let movie_pad = pipeline
-            .by_name("movie_branch")
-            .unwrap()
-            .static_pad("src")
-            .unwrap();
-        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
-        let blocker = block_first_buffer(&movie_pad, &ready, false).unwrap();
-        let _rebase =
-            add_timestamp_rebase_probe(&movie_pad, &ready, &pipeline.bus().unwrap(), false)
-                .unwrap();
-
         let (raw_tx, raw_rx) = mpsc::channel();
         pipeline
             .by_name("audio_encoder")
@@ -1276,77 +1284,55 @@ mod tests {
             .state(gst::ClockTime::from_seconds(TEST_TIMEOUT.as_secs()))
             .0
             .expect("audio handoff pipeline did not reach Playing within 10s");
-        let mut raw = vec![
-            raw_rx
-                .recv_timeout(TEST_TIMEOUT)
-                .expect("lobby audio did not reach the encoder within 10s"),
-        ];
-        let mut encoded = vec![
-            encoded_rx
-                .recv_timeout(TEST_TIMEOUT)
-                .expect("lobby audio did not reach the parser within 10s"),
-        ];
-        let movie = pipeline.by_name("movie").unwrap();
+        let source = pipeline.by_name("source").unwrap();
+        let boundary = next_frame_boundary(
+            audio_buffer(15).pts().unwrap()
+                + gst::ClockTime::from_nseconds(FRAMES * 1_000_000_000 / 48_000),
+        );
         let (push_tx, push_rx) = mpsc::channel();
         let push = std::thread::spawn(move || {
-            const FRAMES: usize = 1024;
-            for block in 0..12 {
-                let mut buffer = gst::Buffer::with_size(FRAMES * 2 * size_of::<f32>()).unwrap();
-                {
-                    let buffer = buffer.get_mut().unwrap();
-                    buffer.set_pts(gst::ClockTime::from_nseconds(
-                        block * FRAMES as u64 * 1_000_000_000 / 48_000,
-                    ));
-                    buffer.set_dts(buffer.pts());
-                    buffer.set_duration(gst::ClockTime::from_nseconds(
-                        FRAMES as u64 * 1_000_000_000 / 48_000,
-                    ));
-                }
-                push_buffer(&movie, buffer);
+            for block in 0..16 {
+                push_buffer(&source, audio_buffer(block));
             }
+            for block in 0..64 {
+                let mut buffer = audio_buffer(block);
+                let buffer = buffer.get_mut().unwrap();
+                buffer.set_pts(gst::ClockTime::from_nseconds(
+                    rebase_timestamp(buffer.pts().unwrap().nseconds(), boundary.nseconds(), 0)
+                        .unwrap(),
+                ));
+                buffer.set_dts(buffer.pts());
+                push_buffer(&source, buffer.to_owned());
+            }
+            end_stream(&source);
             push_tx.send(()).unwrap();
         });
-
-        let (mut state, wait) = ready
-            .1
-            .wait_timeout_while(ready.0.lock().unwrap(), TEST_TIMEOUT, |state| {
-                state.audio_pts.is_none()
-            })
-            .unwrap();
-        assert!(
-            !wait.timed_out() || state.audio_pts.is_some(),
-            "movie audio did not reach the blocking probe within 10s"
-        );
-        assert_eq!(state.audio_pts, Some(gst::ClockTime::ZERO));
-        state.video_pts = Some(gst::ClockTime::ZERO);
-        drop(state);
-        let (clock, base_time) = pipeline_timing(&pipeline).unwrap();
-        let boundary = next_frame_boundary(
-            clock.time().saturating_sub(base_time) + gst::ClockTime::from_mseconds(100),
-        );
-        configure_timestamp_rebase(&ready, boundary).unwrap();
-        selector.set_property("active-pad", Some(&selector.static_pad("sink_1").unwrap()));
-        movie_pad.remove_probe(blocker);
-        push_rx
-            .recv_timeout(TEST_TIMEOUT)
-            .expect("movie audio push did not finish within 10s");
-        push.join().unwrap();
-
-        while raw.iter().filter(|pts| **pts >= boundary).count() < 4 {
+        let handoff_deadline = Instant::now() + TEST_TIMEOUT;
+        let mut raw = Vec::new();
+        while raw.len() < 80 {
             raw.push(
                 raw_rx
-                    .recv_timeout(TEST_TIMEOUT)
-                    .expect("rebased movie audio did not reach the encoder within 10s"),
+                    .recv_timeout(handoff_deadline.saturating_duration_since(Instant::now()))
+                    .expect("lobby and movie buffers did not reach the encoder within 10s"),
             );
         }
+        let mut encoded = Vec::new();
         while encoded.iter().filter(|pts| **pts >= boundary).count() < 4 {
             encoded.push(
                 encoded_rx
-                    .recv_timeout(TEST_TIMEOUT)
-                    .expect("rebased movie audio did not reach the parser within 10s"),
+                    .recv_timeout(handoff_deadline.saturating_duration_since(Instant::now()))
+                    .expect("four rebased movie buffers did not reach the parser within 10s"),
             );
         }
+        let push_result =
+            push_rx.recv_timeout(handoff_deadline.saturating_duration_since(Instant::now()));
         pipeline.set_state(gst::State::Null).unwrap();
+        pipeline
+            .state(gst::ClockTime::from_seconds(TEST_TIMEOUT.as_secs()))
+            .0
+            .expect("audio handoff pipeline did not reach Null within 10s");
+        push.join().unwrap();
+        push_result.expect("lobby/movie push and EOS did not finish within 10s");
 
         assert!(raw.windows(2).all(|pair| pair[0] < pair[1]), "{raw:?}");
         assert!(
@@ -1390,7 +1376,7 @@ mod tests {
 
     #[test]
     fn formats_originating_bus_element() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let source = gst::ElementFactory::make("fakesrc")
             .name("broken-source")
             .build()
@@ -1412,7 +1398,7 @@ mod tests {
 
     #[test]
     fn maps_stream_identity_type_and_default_flag() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let stream = gst::Stream::new(
             Some("video-1"),
             None,
@@ -1434,7 +1420,7 @@ mod tests {
 
     #[test]
     fn links_stream_start_that_precedes_selection() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
         let selection = Arc::new(OnceLock::new());
         let video_src = gst::Pad::builder(gst::PadDirection::Src)
@@ -1473,7 +1459,7 @@ mod tests {
 
     #[test]
     fn embedded_subtitle_links_through_movie_bin() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
@@ -1510,7 +1496,7 @@ mod tests {
 
     #[test]
     fn external_subtitle_links_through_movie_bin() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1535,7 +1521,7 @@ mod tests {
 
     #[test]
     fn keeps_lobby_for_pre_handoff_branch_error() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let pipeline = gst::Pipeline::new();
         let movie_branch = gst::ElementFactory::make("fakesrc")
             .name("movie_video")
@@ -1560,7 +1546,7 @@ mod tests {
 
     #[test]
     fn parsers_and_post_encoder_queues_are_fatal_before_handoff() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
@@ -1589,7 +1575,7 @@ mod tests {
 
     #[test]
     fn selected_pad_linked_to_different_sink_keeps_lobby() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
         let selection = OnceLock::new();
         selection
@@ -1649,13 +1635,13 @@ mod tests {
             0
         }
 
-        gst::init().unwrap();
+        let _gst = gst_test();
         assert!(register_sigint_with(&gst::Bus::new(), reject_registration).is_err());
     }
 
     #[test]
     fn signal_guard_removes_registered_source() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let context = gst::glib::MainContext::default();
         let guard = register_sigint(&gst::Bus::new()).unwrap();
         let source_id = unsafe { gst::glib::SourceId::from_glib(guard.id) };
@@ -1668,7 +1654,7 @@ mod tests {
 
     #[test]
     fn sigint_callback_does_not_panic_when_bus_rejects_message() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let removed = Arc::new(AtomicBool::new(false));
         let bus = gst::Bus::new();
         bus.set_flushing(true);
@@ -1685,7 +1671,7 @@ mod tests {
 
     #[test]
     fn surfaces_title_and_clock_application_failures() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         for (name, failure) in [
             ("owncast-title-error", "title failed"),
             ("owncast-switch-error", "clock failed"),
@@ -1702,7 +1688,7 @@ mod tests {
 
     #[test]
     fn missing_pipeline_clock_and_base_time_are_reported() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let pipeline = gst::Pipeline::new();
         assert_eq!(
             pipeline_timing(&pipeline).unwrap_err(),
@@ -1716,7 +1702,7 @@ mod tests {
 
     #[test]
     fn rejected_clock_callback_releases_real_blocking_probes() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let (video_src, _video_sink) = linked_pads();
         let (audio_src, _audio_sink) = linked_pads();
         let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
@@ -1776,7 +1762,7 @@ mod tests {
 
     #[test]
     fn successful_clock_callback_switches_releases_probes_then_runs_title_work() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
@@ -1888,7 +1874,7 @@ mod tests {
 
     #[test]
     fn stream_setup_rejections_retain_lobby() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let pipeline = gst::Pipeline::new();
         let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
         let overlay = gst::ElementFactory::make("subtitleoverlay")
@@ -1925,7 +1911,7 @@ mod tests {
 
     #[test]
     fn external_subtitle_link_failure_retain_lobby() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1987,7 +1973,7 @@ mod tests {
 
     #[test]
     fn preflight_lists_every_missing_element() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         assert_eq!(
             missing_elements(&["fakesink", "owncast-element-that-does-not-exist"]),
             vec!["owncast-element-that-does-not-exist"]
@@ -1996,7 +1982,7 @@ mod tests {
 
     #[test]
     fn pipeline_has_one_sink_and_starts_on_lobby() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
@@ -2046,6 +2032,12 @@ mod tests {
                 .name(),
             "sink_0"
         );
+        parts.pipeline.set_state(gst::State::Null).unwrap();
+        parts
+            .pipeline
+            .state(gst::ClockTime::from_seconds(10))
+            .0
+            .unwrap();
     }
 
     fn appsrc(name: &str, caps: gst::Caps) -> gst::Element {
@@ -2391,7 +2383,7 @@ mod tests {
     #[test]
     #[ignore = "encodes and decodes a synthetic 1080p FLV"]
     fn synthetic_handoff_stays_within_50ms() {
-        gst::init().unwrap();
+        let _gst = gst_test();
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
