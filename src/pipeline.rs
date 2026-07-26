@@ -171,6 +171,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "textoverlay",
     "subtitleoverlay",
     "subparse",
+    "typefind",
     "queue",
     "input-selector",
     "videoconvert",
@@ -757,7 +758,7 @@ fn add_external_subtitles(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let subtitles = gst::parse::bin_from_description_with_name(
-        "filesrc name=source ! subparse ! queue",
+        "filesrc name=source ! typefind name=source_type ! queue",
         true,
         "movie_external_subtitles",
     )?;
@@ -1533,6 +1534,16 @@ mod tests {
         assert_eq!(
             parts.subtitle_overlay.property::<i64>("subtitle-ts-offset"),
             SUBTITLE_ADVANCE_NS
+        );
+        assert!(
+            parts
+                .pipeline
+                .by_name("movie_external_subtitles")
+                .unwrap()
+                .downcast::<gst::Bin>()
+                .unwrap()
+                .by_name("source_type")
+                .is_some()
         );
         fs::remove_file(subtitle).unwrap();
     }
