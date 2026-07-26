@@ -207,6 +207,7 @@ pub(crate) struct PipelineParts {
     pub(crate) movie_audio_pad: gst::Pad,
     pub(crate) movie_video_sink: gst::Pad,
     pub(crate) movie_audio_sink: gst::Pad,
+    pub(crate) movie_subtitle_sink: gst::Pad,
     pub(crate) movie_video_src: gst::Pad,
     pub(crate) movie_audio_src: gst::Pad,
     pub(crate) subtitle_overlay: gst::Element,
@@ -358,6 +359,9 @@ impl PipelineParts {
             movie_audio_sink: audio_bin
                 .static_pad("sink")
                 .ok_or_else(|| error("Movie audio input is missing"))?,
+            movie_subtitle_sink: video_bin
+                .static_pad("sink")
+                .ok_or_else(|| error("Movie subtitle input is missing"))?,
             movie_video_src: video_bin
                 .static_pad("src")
                 .ok_or_else(|| error("Movie video output is missing"))?,
@@ -384,7 +388,6 @@ struct ReadyState {
     enter_pressed: bool,
     failure: Option<String>,
     pending_pads: Vec<PendingPad>,
-    claimed_streams: Vec<(String, gst::Pad)>,
     blocking_probes: Option<BlockingProbes>,
 }
 
@@ -434,35 +437,14 @@ fn resolve_pending_pads(
         } else {
             None
         };
-        if let Some(sink) = sink {
-            let mut state = ready.0.lock().unwrap();
-            if state
-                .claimed_streams
-                .iter()
-                .any(|(claimed_id, claimed_sink)| claimed_id == stream_id && claimed_sink == sink)
-            {
-                continue;
-            }
-            state
-                .claimed_streams
-                .push((stream_id.to_owned(), sink.clone()));
-            drop(state);
-            if pending.pad.peer().as_ref() != Some(sink)
-                && let Err(failure) = pending.pad.link(sink)
-            {
-                ready
-                    .0
-                    .lock()
-                    .unwrap()
-                    .claimed_streams
-                    .retain(|(claimed_id, claimed_sink)| {
-                        claimed_id != stream_id || claimed_sink != sink
-                    });
-                retain_lobby(
-                    ready,
-                    format!("Cannot link selected stream {stream_id}: {failure}"),
-                );
-            }
+        if let Some(sink) = sink
+            && pending.pad.peer().as_ref() != Some(sink)
+            && let Err(failure) = pending.pad.link(sink)
+        {
+            retain_lobby(
+                ready,
+                format!("Cannot link selected stream {stream_id}: {failure}"),
+            );
         }
     }
     ready.0.lock().unwrap().pending_pads.extend(unresolved);
@@ -670,7 +652,7 @@ where
 
 fn add_external_subtitles(
     pipeline: &gst::Pipeline,
-    overlay: &gst::Element,
+    sink: &gst::Pad,
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let subtitles = gst::parse::bin_from_description_with_name(
@@ -686,11 +668,7 @@ fn add_external_subtitles(
     subtitles
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?
-        .link(
-            &overlay
-                .static_pad("subtitle_sink")
-                .ok_or_else(|| error("Subtitle overlay input is missing"))?,
-        )?;
+        .link(sink)?;
     subtitles.sync_state_with_parent()?;
     Ok(())
 }
@@ -715,7 +693,7 @@ fn configure_movie_streams(
     };
     match &chosen.subtitle {
         SubtitleSource::External(path) => {
-            if let Err(failure) = add_external_subtitles(pipeline, overlay, path) {
+            if let Err(failure) = add_external_subtitles(pipeline, &sinks.subtitle, path) {
                 retain_lobby(
                     ready,
                     format!("Cannot prepare external subtitles: {failure}"),
@@ -829,10 +807,7 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let sinks = SelectedSinks {
         video: parts.movie_video_sink.clone(),
         audio: parts.movie_audio_sink.clone(),
-        subtitle: parts
-            .subtitle_overlay
-            .static_pad("subtitle_sink")
-            .ok_or_else(|| error("Subtitle overlay input is missing"))?,
+        subtitle: parts.movie_subtitle_sink.clone(),
     };
     let selected = selection.clone();
     let pad_ready = ready.clone();
@@ -1107,46 +1082,65 @@ mod tests {
     }
 
     #[test]
-    fn repeated_selected_stream_resolution_links_once() {
+    fn embedded_subtitle_links_through_movie_bin() {
         gst::init().unwrap();
+        let config = Config {
+            video: PathBuf::from("/tmp/movie.mkv"),
+            subtitles: None,
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
         let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
         let selection = OnceLock::new();
         selection
             .set(Selection {
                 video_id: "video".into(),
                 audio_id: "audio".into(),
-                subtitle: SubtitleSource::None,
+                subtitle: SubtitleSource::Embedded("subtitle".into()),
             })
             .unwrap();
-        let first_video_src = gst::Pad::builder(gst::PadDirection::Src)
-            .name("first-video-src")
-            .build();
-        let repeated_video_src = gst::Pad::builder(gst::PadDirection::Src)
-            .name("repeated-video-src")
-            .build();
-        let video_sink = gst::Pad::builder(gst::PadDirection::Sink)
-            .name("video-sink")
-            .build();
+        let subtitle_src = gst::Pad::new(gst::PadDirection::Src);
         let sinks = SelectedSinks {
-            video: video_sink.clone(),
-            audio: gst::Pad::new(gst::PadDirection::Sink),
-            subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            video: parts.movie_video_sink.clone(),
+            audio: parts.movie_audio_sink.clone(),
+            subtitle: parts.movie_subtitle_sink.clone(),
         };
-        ready.0.lock().unwrap().pending_pads.extend([
-            PendingPad {
-                pad: first_video_src.clone(),
-                stream_id: Some("video".into()),
-            },
-            PendingPad {
-                pad: repeated_video_src,
-                stream_id: Some("video".into()),
-            },
-        ]);
+        ready.0.lock().unwrap().pending_pads.push(PendingPad {
+            pad: subtitle_src.clone(),
+            stream_id: Some("subtitle".into()),
+        });
 
         resolve_pending_pads(&ready, &selection, &sinks);
 
-        assert_eq!(video_sink.peer(), Some(first_video_src));
+        assert_eq!(subtitle_src.peer(), Some(parts.movie_subtitle_sink.clone()));
         assert!(ready.0.lock().unwrap().failure.is_none());
+    }
+
+    #[test]
+    fn external_subtitle_links_through_movie_bin() {
+        gst::init().unwrap();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let subtitle = std::env::temp_dir().join(format!("owncast-subtitle-{suffix}.srt"));
+        fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
+        let config = Config {
+            video: PathBuf::from("/tmp/movie.mkv"),
+            subtitles: Some(subtitle.clone()),
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
+
+        assert!(parts.movie_subtitle_sink.peer().is_none());
+        add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
+
+        assert!(parts.movie_subtitle_sink.peer().is_some());
+        fs::remove_file(subtitle).unwrap();
     }
 
     #[test]
@@ -1204,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_pad_link_failure_keeps_lobby() {
+    fn selected_pad_linked_to_different_sink_keeps_lobby() {
         gst::init().unwrap();
         let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
         let selection = OnceLock::new();
