@@ -127,7 +127,7 @@ impl PipelineParts {
 
         let video_bin = gst::parse::bin_from_description(
             r#"
-            queue max-size-buffers=2
+            queue name=movie_video_input max-size-buffers=2
               ! videoconvert
               ! aspectratiocrop aspect-ratio=16/9
               ! videoscale
@@ -138,6 +138,16 @@ impl PipelineParts {
             "#,
             true,
         )?;
+        let movie_video_sink = gst::GhostPad::builder_with_target(
+            &video_bin
+                .by_name("movie_video_input")
+                .ok_or_else(|| error("Movie video input queue is missing"))?
+                .static_pad("sink")
+                .ok_or_else(|| error("Movie video input is missing"))?,
+        )?
+        .name("video_sink")
+        .build();
+        video_bin.add_pad(&movie_video_sink)?;
         let audio_bin = gst::parse::bin_from_description("queue max-size-buffers=8", true)?;
         pipeline.add(&video_bin)?;
         pipeline.add(&audio_bin)?;
@@ -176,9 +186,7 @@ impl PipelineParts {
             movie,
             video_selector,
             audio_selector,
-            movie_video_sink: video_bin
-                .static_pad("sink")
-                .ok_or_else(|| error("Movie video input is missing"))?,
+            movie_video_sink: movie_video_sink.upcast(),
             movie_audio_sink: audio_bin
                 .static_pad("sink")
                 .ok_or_else(|| error("Movie audio input is missing"))?,
@@ -222,6 +230,23 @@ mod tests {
 
         let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
         parts.pipeline.remove(&parts.movie).unwrap();
+        let movie_video =
+            gst::parse::bin_from_description("videotestsrc is-live=true pattern=white", true)
+                .unwrap();
+        let movie_audio =
+            gst::parse::bin_from_description("audiotestsrc is-live=true wave=ticks", true).unwrap();
+        parts.pipeline.add(&movie_video).unwrap();
+        parts.pipeline.add(&movie_audio).unwrap();
+        movie_video
+            .static_pad("src")
+            .unwrap()
+            .link(&parts.movie_video_sink)
+            .unwrap();
+        movie_audio
+            .static_pad("src")
+            .unwrap()
+            .link(&parts.movie_audio_sink)
+            .unwrap();
         parts.pipeline.set_state(gst::State::Playing).unwrap();
         parts
             .pipeline
