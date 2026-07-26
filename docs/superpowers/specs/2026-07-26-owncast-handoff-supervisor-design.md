@@ -21,7 +21,7 @@ The supervisor:
 3. requires the child to remain alive and API status to prove `online=true`,
    title `Starting soon: Passenger`, and a nonempty `lastConnectTime`;
 4. calculates a conservative upper-bound delay from `lastConnectTime` to the
-   local proof timestamp and refuses the handoff if it exceeds five seconds;
+   local proof timestamp and refuses the handoff if it exceeds 14 seconds;
 5. writes exactly one newline to the child stdin pipe, records the timestamp,
    closes stdin, and rejects any second send;
 6. waits for API title `Passenger`, unchanged `lastConnectTime`, exactly one
@@ -42,6 +42,11 @@ The captured stdout lines are diagnostic only. Rust buffers stdout when it is
 redirected to a file, so lobby and movie messages can appear only during
 shutdown and cannot serve as bounded readiness gates.
 
+Owncast's complete lobby API proof has been observed at roughly 13 seconds
+after connection. The 14-second limit admits that real readiness latency; the
+separate segment-0-to-Enter limit remains the authoritative retained-coverage
+gate.
+
 ## Scope
 
 - The installed streamer, production repository, validator, Owncast,
@@ -59,7 +64,7 @@ process to prove:
 - the child launches without blocking;
 - a live child plus valid API lobby proof writes exactly one newline and
   closes stdin;
-- a proof over five seconds causes no newline;
+- a proof at 14 seconds passes and a proof over 14 seconds causes no newline;
 - a title or connection change fails;
 - cleanup waits for an explicit child-ready line, sends one SIGINT, and reaps
   the exact child without a race or orphan.
@@ -68,7 +73,7 @@ Before live execution, an independent review verifies the script, self-test
 output, hashes, root-only modes, absence of credentials, and lack of changes
 to the reviewed collector and production binary.
 
-The live attempt passes only when Enter occurs within five seconds of the
-recorded connection, the detected movie boundary is before 15.5 seconds in
-the retained timeline, segment evidence `0..30` is complete, and all existing
-single-connection, title, auth, health, cleanup, and integrity gates pass.
+The live attempt passes only when Enter occurs within 14 seconds of the
+recorded connection and within 15.5 seconds of retained segment 0, segment
+evidence `0..30` is complete, and all existing single-connection, title, auth,
+health, cleanup, and integrity gates pass.
