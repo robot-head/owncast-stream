@@ -279,9 +279,12 @@ Attempt 13 input manifests. Append the exact sanitized result and DTS
 disposition to the existing Task 5 report and ledger. Submit the sealed
 evaluation for an independent read-only task review.
 
-- [ ] **Step 5: Commit only this implementation plan**
+- [ ] **Step 5: Verify the implementation plan is committed**
 
 ```bash
-git add docs/superpowers/plans/2026-07-26-attempt13-retained-validator.md
-git commit -m "docs: plan Attempt 13 retained validation"
+git status --short
+git log --oneline -- docs/superpowers/plans/2026-07-26-attempt13-retained-validator.md
 ```
+
+Require a clean repository and committed history for this plan. Do not create
+an empty or duplicate commit.
