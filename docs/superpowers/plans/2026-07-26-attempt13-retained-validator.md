@@ -17,6 +17,7 @@
 - Bind the final live playlist to `a336d16633268688345bd7b742df7a5530ce99425ac3f66a906661a53cc03bdc`.
 - Derive and freeze the adapter digest through static preparation before any retained decode.
 - Keep every existing 50 ms threshold, content window, transport-boundary rule, continuity check, source control, language classifier, and subtitle classifier unchanged.
+- Skip exactly `local_hls_with_large_transport_pts_decodes_at_zero_running_time` and `local_lobby_movie_switch_fixture_calibrates_boundaries` during preparation because they invoke media decoders; require all other offline tests.
 - Run `--real-retained` exactly once, only after independent review passes.
 - Do not retry or modify code, thresholds, evidence, or inputs after the real evaluation starts.
 
@@ -155,13 +156,16 @@ From `/var/tmp/attempt13-validator`, capture complete output and statuses in
 
 ```bash
 sudo timeout 120s cargo fmt --check
-sudo timeout 120s cargo test --offline
+sudo timeout 120s cargo test --offline -- \
+  --skip local_hls_with_large_transport_pts_decodes_at_zero_running_time \
+  --skip local_lobby_movie_switch_fixture_calibrates_boundaries
 sudo timeout 120s cargo clippy --offline -- -D warnings
 sudo timeout 120s cargo build --offline --release
 sudo timeout 120s target/release/attempt4-validator --selfcheck
 ```
 
-Require every command to exit zero with pristine output. Do not invoke
+Require every command to exit zero with pristine output. Require 44 passed,
+zero failed, and exactly two filtered-out decoder tests. Do not invoke
 `--real-retained`, any diagnostic, or any decoder.
 
 - [ ] **Step 7: Freeze the candidate**
@@ -208,6 +212,8 @@ Require:
 - adapter RED proves the manifest and playlist pass before the old adapter
   digest rejects;
 - adapter GREEN proves 31 segments and exactly 93 seconds;
+- the recorded test command names both decoder-backed tests as skipped and
+  its result reports 44 passed, zero failed, and two filtered out;
 - sealed Attempt 7 evidence is rejected by the rebound validator;
 - candidate manifest, binary, documentation, and all logs verify;
 - the 50 ms constants, boundary helper, parser, adapter serializer, decoders,

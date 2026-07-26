@@ -54,9 +54,12 @@ Use static adapter preparation as the behavioral TDD gate:
 5. no decoder, retained evaluation, timeline diagnostic, source classifier,
    or subtitle classifier may run during preparation.
 
-Run the full offline non-media test, formatting, Clippy, release-build, and
-selfcheck gates. Freeze source, binary, documentation, RED/GREEN logs, and
-checksums in a new root-only bundle.
+Run the offline test suite while skipping exactly
+`local_hls_with_large_transport_pts_decodes_at_zero_running_time` and
+`local_lobby_movie_switch_fixture_calibrates_boundaries`, the two tests that
+invoke media decoders. Require the remaining 44 tests, formatting, Clippy,
+release build, and selfcheck to pass. Freeze source, binary, documentation,
+RED/GREEN logs, and checksums in a new root-only bundle.
 
 ## Independent review
 
@@ -72,6 +75,8 @@ The review must prove:
 - the 50 ms thresholds, transport-boundary fix, evidence parser, adapter,
   decoders, continuity checks, source windows, language classifier, and
   subtitle classifier are unchanged;
+- the two decoder-backed fixture tests were explicitly skipped and the other
+  44 offline tests passed;
 - no retained decode or evaluation ran during preparation.
 
 No real evaluation may run until the scoped review passes.
