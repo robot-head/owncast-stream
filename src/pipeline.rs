@@ -550,6 +550,21 @@ fn record_first_pts(
     ready.1.notify_all();
 }
 
+fn block_first_buffer(
+    pad: &gst::Pad,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    video: bool,
+) -> Option<gst::PadProbeId> {
+    let ready = ready.clone();
+    pad.add_probe(
+        gst::PadProbeType::BLOCK | gst::PadProbeType::BUFFER,
+        move |_, info| {
+            record_first_pts(&ready, video, info);
+            gst::PadProbeReturn::Ok
+        },
+    )
+}
+
 struct BlockingProbes {
     video: Option<(gst::Pad, gst::PadProbeId)>,
     audio: Option<(gst::Pad, gst::PadProbeId)>,
@@ -777,27 +792,9 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let selection = Arc::new(OnceLock::<Selection>::new());
     let switched = Arc::new(AtomicBool::new(false));
 
-    let video_ready = ready.clone();
-    let video_probe = parts
-        .movie_video_src
-        .add_probe(
-            gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
-            move |_, info| {
-                record_first_pts(&video_ready, true, info);
-                gst::PadProbeReturn::Ok
-            },
-        )
+    let video_probe = block_first_buffer(&parts.movie_video_src, &ready, true)
         .ok_or_else(|| error("Cannot block movie video"))?;
-    let audio_ready = ready.clone();
-    let audio_probe = parts
-        .movie_audio_src
-        .add_probe(
-            gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
-            move |_, info| {
-                record_first_pts(&audio_ready, false, info);
-                gst::PadProbeReturn::Ok
-            },
-        )
+    let audio_probe = block_first_buffer(&parts.movie_audio_src, &ready, false)
         .ok_or_else(|| error("Cannot block movie audio"))?;
     ready.0.lock().unwrap().blocking_probes = Some(BlockingProbes {
         video: Some((parts.movie_video_src.clone(), video_probe)),
@@ -963,6 +960,63 @@ mod tests {
         let segment = gst::FormattedSegment::<gst::ClockTime>::new();
         source.push_event(gst::event::Segment::new(segment.as_ref()));
         (source, sink)
+    }
+
+    #[test]
+    fn first_buffer_probe_passes_startup_events_before_blocking_media() {
+        gst::init().unwrap();
+        let source = gst::Pad::new(gst::PadDirection::Src);
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .chain_function(|_, _, _| Ok(gst::FlowSuccess::Ok))
+            .build();
+        source.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        source.link(&sink).unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let probe = block_first_buffer(&source, &ready, true).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if matches!(
+                info.event().map(|event| event.view()),
+                Some(gst::EventView::StreamStart(_) | gst::EventView::Segment(_))
+            ) {
+                event_tx.send(()).unwrap();
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .unwrap();
+        let (flow_tx, flow_rx) = mpsc::channel();
+        let push_source = source.clone();
+        std::thread::spawn(move || {
+            assert!(push_source.push_event(gst::event::StreamStart::new("test")));
+            let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+            assert!(push_source.push_event(gst::event::Segment::new(segment.as_ref())));
+            let mut buffer = gst::Buffer::new();
+            buffer
+                .get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_seconds(7));
+            flow_tx.send(push_source.push(buffer)).unwrap();
+        });
+
+        event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let state = ready
+            .1
+            .wait_timeout_while(ready.0.lock().unwrap(), Duration::from_secs(1), |state| {
+                state.video_pts.is_none()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(state.video_pts, Some(gst::ClockTime::from_seconds(7)));
+        drop(state);
+        source.remove_probe(probe);
+        assert!(
+            flow_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
     }
 
     fn stream_collection_message(movie: &gst::Element) -> gst::Message {
