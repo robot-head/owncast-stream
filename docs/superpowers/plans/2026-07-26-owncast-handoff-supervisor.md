@@ -40,7 +40,7 @@
 Implement `--selftest` before the production path exists. It must assert:
 
 ```bash
-test "$(delay_ms 2026-07-26T15:00:00Z 1753542004500)" -eq 4500
+test "$(delay_ms 2026-07-26T15:00:00Z 1785078004500)" -eq 4500
 handoff_allowed true "Starting soon: Passenger" value 4500
 ! handoff_allowed true "Starting soon: Passenger" value 5001
 ! handoff_allowed true Passenger value 100
@@ -82,7 +82,9 @@ streamer_pid=$!
 ```
 
 `delay_ms` parses `lastConnectTime` with `date -u -d` and subtracts it from
-the millisecond proof timestamp using base-10 integer arithmetic.
+the millisecond proof timestamp using base-10 integer arithmetic. Construct
+the proof timestamp as `seconds * 1000 + first_three_nanosecond_digits`;
+do not use `date +%s%3N`, whose width behavior is not portable on this host.
 
 `handoff_allowed` returns success only for:
 
