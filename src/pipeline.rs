@@ -19,7 +19,7 @@ use crate::{
     set_title,
 };
 
-const SUBTITLE_ADVANCE_NS: i64 = 100_000_000;
+const SUBTITLE_ADVANCE_MS: u64 = 100;
 
 fn rebase_timestamp(timestamp: u64, boundary: u64, first_pts: u64) -> Result<u64, String> {
     let rebased = i128::from(timestamp) + i128::from(boundary) - i128::from(first_pts);
@@ -171,7 +171,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "textoverlay",
     "subtitleoverlay",
     "subparse",
-    "typefind",
+    "appsrc",
     "queue",
     "input-selector",
     "videoconvert",
@@ -757,26 +757,87 @@ fn add_external_subtitles(
     sink: &gst::Pad,
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
+    let contents = advance_srt(&std::fs::read_to_string(path)?).map_err(error)?;
     let subtitles = gst::parse::bin_from_description_with_name(
-        "filesrc name=source ! typefind name=source_type ! queue",
+        "appsrc name=source format=bytes ! subparse ! queue",
         true,
         "movie_external_subtitles",
     )?;
-    subtitles
+    let source = subtitles
         .by_name("source")
-        .ok_or_else(|| error("External subtitle source is missing"))?
-        .set_property("location", path);
-    pipeline
-        .by_name("movie_subtitles")
-        .ok_or_else(|| error("Movie subtitle overlay is missing"))?
-        .set_property("subtitle-ts-offset", SUBTITLE_ADVANCE_NS);
+        .ok_or_else(|| error("External subtitle source is missing"))?;
+    source.set_property("caps", gst::Caps::builder("application/x-subtitle").build());
     pipeline.add(&subtitles)?;
     let output = subtitles
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?;
     output.link(sink)?;
     subtitles.sync_state_with_parent()?;
+    let mut buffer = gst::Buffer::from_mut_slice(contents.into_bytes());
+    if source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&mut buffer]) != gst::FlowReturn::Ok
+        || source.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]) != gst::FlowReturn::Ok
+    {
+        return Err(error("Cannot feed external subtitles"));
+    }
     Ok(())
+}
+
+fn parse_srt_timestamp(value: &str) -> Result<u64, String> {
+    let fields: Vec<_> = value.split([':', ',']).collect();
+    if fields.len() != 4 {
+        return Err(format!("Invalid SRT timestamp: {value}"));
+    }
+    let values: Vec<u64> = fields
+        .iter()
+        .map(|field| {
+            field
+                .parse()
+                .map_err(|_| format!("Invalid SRT timestamp: {value}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if values[1] >= 60 || values[2] >= 60 || values[3] >= 1_000 {
+        return Err(format!("Invalid SRT timestamp: {value}"));
+    }
+    Ok(((values[0] * 60 + values[1]) * 60 + values[2]) * 1_000 + values[3])
+}
+
+fn format_srt_timestamp(milliseconds: u64) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = milliseconds / 60_000 % 60;
+    let seconds = milliseconds / 1_000 % 60;
+    let milliseconds = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}")
+}
+
+fn advance_srt(input: &str) -> Result<String, String> {
+    let mut output = Vec::new();
+    for line in input.lines() {
+        let Some((start, remainder)) = line.split_once(" --> ") else {
+            output.push(line.to_owned());
+            continue;
+        };
+        let (end, suffix) = remainder
+            .split_once(' ')
+            .map_or((remainder, ""), |(end, suffix)| (end, suffix));
+        let start = parse_srt_timestamp(start)?.saturating_sub(SUBTITLE_ADVANCE_MS);
+        let end = parse_srt_timestamp(end)?.saturating_sub(SUBTITLE_ADVANCE_MS);
+        let suffix = if suffix.is_empty() {
+            String::new()
+        } else {
+            format!(" {suffix}")
+        };
+        output.push(format!(
+            "{} --> {}{}",
+            format_srt_timestamp(start),
+            format_srt_timestamp(end),
+            suffix
+        ));
+    }
+    let mut output = output.join("\n");
+    if input.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1531,10 +1592,6 @@ mod tests {
         add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
 
         assert!(parts.movie_subtitle_sink.peer().is_some());
-        assert_eq!(
-            parts.subtitle_overlay.property::<i64>("subtitle-ts-offset"),
-            SUBTITLE_ADVANCE_NS
-        );
         assert!(
             parts
                 .pipeline
@@ -1542,10 +1599,24 @@ mod tests {
                 .unwrap()
                 .downcast::<gst::Bin>()
                 .unwrap()
-                .by_name("source_type")
-                .is_some()
+                .by_name("source")
+                .unwrap()
+                .factory()
+                .is_some_and(|factory| factory.name() == "appsrc")
         );
         fs::remove_file(subtitle).unwrap();
+    }
+
+    #[test]
+    fn external_srt_timestamps_are_advanced_by_100ms() {
+        let input = "1\n00:01:02,187 --> 00:01:03,480\nHello\n\n\
+                     2\n00:00:00,050 --> 00:00:00,150\nEarly\n";
+
+        assert_eq!(
+            advance_srt(input).unwrap(),
+            "1\n00:01:02,087 --> 00:01:03,380\nHello\n\n\
+             2\n00:00:00,000 --> 00:00:00,050\nEarly\n"
+        );
     }
 
     #[test]
