@@ -10,7 +10,9 @@ Attempt 13 capture, then run exactly one complete retained-content evaluation.
 Clone `/var/tmp/attempt7-validator-fix` into a new root-only candidate and
 change only its three frozen evidence-binding digests and documentation:
 the retained root manifest, final live playlist, and deterministic local
-adapter. Keep the evidence path as the existing CLI argument.
+adapter. Also rename the static preparation status fields from `segments` to
+`segment_count` and from `duration_ns` to `total_duration_ns`. Keep the
+evidence path as the existing CLI argument.
 
 This is narrower than adding a configurable digest and safer than weakening
 the manifest check. The validator must continue rejecting every evidence root
@@ -46,7 +48,10 @@ Use static adapter preparation as the behavioral TDD gate:
    reach the old local-adapter digest check and reject it;
 3. hash that generated adapter, freeze its digest, rebuild, and require a
    fresh static adapter preparation to pass;
-4. no decoder, retained evaluation, timeline diagnostic, source classifier,
+4. require the real static CLI output to fail an assertion for the two new
+   status-field names, rename only those fields, and require the same assertion
+   to pass;
+5. no decoder, retained evaluation, timeline diagnostic, source classifier,
    or subtitle classifier may run during preparation.
 
 Run the full offline non-media test, formatting, Clippy, release-build, and
@@ -62,7 +67,7 @@ its implementation plan.
 The review must prove:
 
 - the only executable-code changes are the three evidence-binding digest
-  constants;
+  constants and two static status-field labels;
 - the Attempt 13 manifest is accepted and the Attempt 7 manifest is rejected;
 - the 50 ms thresholds, transport-boundary fix, evidence parser, adapter,
   decoders, continuity checks, source windows, language classifier, and

@@ -12,7 +12,7 @@
 
 - Do not modify the production repository source, installed streamer, Owncast, collector, sealed evidence, prior validator candidate, or prior review package.
 - Add no dependency, CLI option, network request, retry, marker, threshold change, classifier change, decoder change, or timing change.
-- Change executable code only at `RETAINED_MANIFEST_SHA256`, `RETAINED_PLAYLIST_SHA256`, and `RETAINED_ADAPTER_SHA256`.
+- Change executable code only at `RETAINED_MANIFEST_SHA256`, `RETAINED_PLAYLIST_SHA256`, `RETAINED_ADAPTER_SHA256`, and the two static preparation status labels.
 - Bind the root manifest to `bcc58ba6faefe553a985e0aa91726fda3090ba51f63358fa5cb4c3a254b2db62`.
 - Bind the final live playlist to `a336d16633268688345bd7b742df7a5530ce99425ac3f66a906661a53cc03bdc`.
 - Derive and freeze the adapter digest through static preparation before any retained decode.
@@ -117,14 +117,38 @@ sudo timeout 120s \
 ```
 
 Expected: exit zero and a status line containing the exact derived adapter
-digest, `segment_count=31`, and `total_duration_ns=93000000000`. Capture the
-complete result as `tdd-adapter-green.log`.
+digest, `segments=31`, and `duration_ns=93000000000`. Capture the complete
+result as `tdd-adapter-green.log`.
 
 Run the same rebuilt candidate once against sealed Attempt 7 evidence with a
 fresh adapter path. Expected: nonzero with
 `retained manifest digest mismatch`. Capture `old-evidence-rejection.log`.
 
-- [ ] **Step 5: Run complete non-media gates**
+- [ ] **Step 5: Rename the static status fields test-first**
+
+Against the real `tdd-adapter-green.log`, require one shell assertion that
+checks for both:
+
+```text
+segment_count=31
+total_duration_ns=93000000000
+```
+
+Capture the assertion and its nonzero status in `tdd-status-fields-red.log`.
+The failure must be caused by the unchanged `segments` and `duration_ns`
+labels.
+
+Change only the `run_prepare_adapter` status format string:
+
+```text
+retained_adapter_prepare=PASS sha256={} segment_count={} total_duration_ns={} network=false media_decode=false
+```
+
+Rebuild offline in release mode and run static adapter preparation with a
+fresh nonexistent `/var/tmp/attempt13-adapter-status-green` path. Require exit
+zero and both exact new fields; capture `tdd-status-fields-green.log`.
+
+- [ ] **Step 6: Run complete non-media gates**
 
 From `/var/tmp/attempt13-validator`, capture complete output and statuses in
 `nonmedia-gates.log`:
@@ -140,12 +164,12 @@ sudo timeout 120s target/release/attempt4-validator --selfcheck
 Require every command to exit zero with pristine output. Do not invoke
 `--real-retained`, any diagnostic, or any decoder.
 
-- [ ] **Step 6: Freeze the candidate**
+- [ ] **Step 7: Freeze the candidate**
 
 Copy the approved design and this plan into the two candidate documentation
 files. Generate `CHECKSUMS.sha256` over `Cargo.toml`, `Cargo.lock`,
 `src/main.rs`, release binary, both documentation files, RED/GREEN logs,
-old-evidence rejection, and the full gate log.
+old-evidence rejection, status-field RED/GREEN logs, and the full gate log.
 
 Require candidate directory mode `0700`, executable mode `0700`, and all
 other frozen files mode `0600`; zero symlinks outside inherited Cargo target
@@ -178,7 +202,8 @@ every entry.
 
 Require:
 
-- source diff changes only the three digest string literals;
+- source diff changes only the three digest string literals and two static
+  status-field labels;
 - manifest RED proves the unchanged validator rejects Attempt 13;
 - adapter RED proves the manifest and playlist pass before the old adapter
   digest rejects;
