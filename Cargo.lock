@@ -110,16 +110,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "ffprobe"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ffef835e1f9ac151db5bb2adbb95c9dfe1f315f987f011dd89cd655b4e9a52c"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -537,9 +527,7 @@ dependencies = [
 name = "owncast-stream"
 version = "0.1.0"
 dependencies = [
- "ffprobe",
  "gstreamer",
- "libc",
  "serde",
  "ureq",
 ]
