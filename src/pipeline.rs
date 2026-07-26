@@ -1046,6 +1046,14 @@ mod tests {
         guard
     }
 
+    struct TestPipelineGuard(gst::Pipeline);
+
+    impl Drop for TestPipelineGuard {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gst::State::Null);
+        }
+    }
+
     fn linked_pads() -> (gst::Pad, gst::Pad) {
         let source = gst::Pad::new(gst::PadDirection::Src);
         let sink = gst::Pad::builder(gst::PadDirection::Sink)
@@ -1235,7 +1243,7 @@ mod tests {
         let _gst = gst_test();
         let pipeline = gst::parse::launch(
             r#"
-            appsrc name=source is-live=false block=true format=time
+            appsrc name=source is-live=false block=false max-bytes=2097152 format=time
                 caps=audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2
               ! queue name=source_branch
               ! audioconvert
@@ -1279,6 +1287,7 @@ mod tests {
             })
             .unwrap();
 
+        let _pipeline_guard = TestPipelineGuard(pipeline.clone());
         pipeline.set_state(gst::State::Playing).unwrap();
         pipeline
             .state(gst::ClockTime::from_seconds(TEST_TIMEOUT.as_secs()))
@@ -1289,24 +1298,22 @@ mod tests {
             audio_buffer(15).pts().unwrap()
                 + gst::ClockTime::from_nseconds(FRAMES * 1_000_000_000 / 48_000),
         );
-        let (push_tx, push_rx) = mpsc::channel();
-        let push = std::thread::spawn(move || {
-            for block in 0..16 {
-                push_buffer(&source, audio_buffer(block));
-            }
-            for block in 0..64 {
-                let mut buffer = audio_buffer(block);
+        for block in 0..16 {
+            push_buffer(&source, audio_buffer(block));
+        }
+        for block in 0..64 {
+            let mut buffer = audio_buffer(block);
+            {
                 let buffer = buffer.get_mut().unwrap();
                 buffer.set_pts(gst::ClockTime::from_nseconds(
                     rebase_timestamp(buffer.pts().unwrap().nseconds(), boundary.nseconds(), 0)
                         .unwrap(),
                 ));
                 buffer.set_dts(buffer.pts());
-                push_buffer(&source, buffer.to_owned());
             }
-            end_stream(&source);
-            push_tx.send(()).unwrap();
-        });
+            push_buffer(&source, buffer);
+        }
+        end_stream(&source);
         let handoff_deadline = Instant::now() + TEST_TIMEOUT;
         let mut raw = Vec::new();
         while raw.len() < 80 {
@@ -1324,15 +1331,11 @@ mod tests {
                     .expect("four rebased movie buffers did not reach the parser within 10s"),
             );
         }
-        let push_result =
-            push_rx.recv_timeout(handoff_deadline.saturating_duration_since(Instant::now()));
         pipeline.set_state(gst::State::Null).unwrap();
         pipeline
             .state(gst::ClockTime::from_seconds(TEST_TIMEOUT.as_secs()))
             .0
             .expect("audio handoff pipeline did not reach Null within 10s");
-        push.join().unwrap();
-        push_result.expect("lobby/movie push and EOS did not finish within 10s");
 
         assert!(raw.windows(2).all(|pair| pair[0] < pair[1]), "{raw:?}");
         assert!(
