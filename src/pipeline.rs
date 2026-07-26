@@ -19,7 +19,7 @@ use crate::{
     set_title,
 };
 
-const SUBTITLE_ADVANCE_NS: u64 = 100_000_000;
+const SUBTITLE_ADVANCE_NS: i64 = 100_000_000;
 
 fn rebase_timestamp(timestamp: u64, boundary: u64, first_pts: u64) -> Result<u64, String> {
     let rebased = i128::from(timestamp) + i128::from(boundary) - i128::from(first_pts);
@@ -757,7 +757,7 @@ fn add_external_subtitles(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let subtitles = gst::parse::bin_from_description_with_name(
-        "filesrc name=source ! subparse ! queue name=subtitle_timing",
+        "filesrc name=source ! subparse ! queue",
         true,
         "movie_external_subtitles",
     )?;
@@ -765,12 +765,10 @@ fn add_external_subtitles(
         .by_name("source")
         .ok_or_else(|| error("External subtitle source is missing"))?
         .set_property("location", path);
-    let timing = subtitles
-        .by_name("subtitle_timing")
-        .and_then(|queue| queue.static_pad("src"))
-        .ok_or_else(|| error("External subtitle timing pad is missing"))?;
-    add_subtitle_timestamp_probe(&timing)
-        .ok_or_else(|| error("Cannot install external subtitle timestamp correction"))?;
+    pipeline
+        .by_name("movie_subtitles")
+        .ok_or_else(|| error("Movie subtitle overlay is missing"))?
+        .set_property("subtitle-ts-offset", SUBTITLE_ADVANCE_NS);
     pipeline.add(&subtitles)?;
     let output = subtitles
         .static_pad("src")
@@ -778,24 +776,6 @@ fn add_external_subtitles(
     output.link(sink)?;
     subtitles.sync_state_with_parent()?;
     Ok(())
-}
-
-fn add_subtitle_timestamp_probe(pad: &gst::Pad) -> Option<gst::PadProbeId> {
-    pad.add_probe(gst::PadProbeType::BUFFER, |_, info| {
-        let Some(buffer) = info.buffer_mut() else {
-            return gst::PadProbeReturn::Ok;
-        };
-        let pts = buffer.pts().map(|timestamp| {
-            gst::ClockTime::from_nseconds(timestamp.nseconds().saturating_sub(SUBTITLE_ADVANCE_NS))
-        });
-        let dts = buffer.dts().map(|timestamp| {
-            gst::ClockTime::from_nseconds(timestamp.nseconds().saturating_sub(SUBTITLE_ADVANCE_NS))
-        });
-        let buffer = buffer.make_mut();
-        buffer.set_pts(pts);
-        buffer.set_dts(dts);
-        gst::PadProbeReturn::Ok
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1550,57 +1530,11 @@ mod tests {
         add_external_subtitles(&parts.pipeline, &parts.movie_subtitle_sink, &subtitle).unwrap();
 
         assert!(parts.movie_subtitle_sink.peer().is_some());
-        assert!(
-            parts
-                .pipeline
-                .by_name("movie_external_subtitles")
-                .unwrap()
-                .downcast::<gst::Bin>()
-                .unwrap()
-                .by_name("subtitle_timing")
-                .is_some()
+        assert_eq!(
+            parts.subtitle_overlay.property::<i64>("subtitle-ts-offset"),
+            SUBTITLE_ADVANCE_NS
         );
         fs::remove_file(subtitle).unwrap();
-    }
-
-    #[test]
-    fn subtitle_timestamp_probe_advances_pts_and_dts_by_100ms() {
-        let _gst = gst_test();
-        let source = gst::Pad::new(gst::PadDirection::Src);
-        let (buffer_tx, buffer_rx) = mpsc::channel();
-        let sink = gst::Pad::builder(gst::PadDirection::Sink)
-            .chain_function(move |_, _, buffer| {
-                buffer_tx
-                    .send((buffer.pts(), buffer.dts(), buffer.duration()))
-                    .unwrap();
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build();
-        source.set_active(true).unwrap();
-        sink.set_active(true).unwrap();
-        source.link(&sink).unwrap();
-        source.push_event(gst::event::StreamStart::new("subtitles"));
-        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
-        source.push_event(gst::event::Segment::new(segment.as_ref()));
-        let _probe = add_subtitle_timestamp_probe(&source).unwrap();
-
-        let mut buffer = gst::Buffer::new();
-        {
-            let buffer = buffer.get_mut().unwrap();
-            buffer.set_pts(gst::ClockTime::from_mseconds(200));
-            buffer.set_dts(gst::ClockTime::from_mseconds(250));
-            buffer.set_duration(gst::ClockTime::from_seconds(1));
-        }
-        source.push(buffer).unwrap();
-
-        assert_eq!(
-            buffer_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (
-                Some(gst::ClockTime::from_mseconds(100)),
-                Some(gst::ClockTime::from_mseconds(150)),
-                Some(gst::ClockTime::from_seconds(1)),
-            )
-        );
     }
 
     #[test]
