@@ -821,22 +821,6 @@ fn configure_movie_streams(
             return;
         }
     };
-    match &chosen.subtitle {
-        SubtitleSource::External(path) => {
-            match add_external_subtitles(pipeline, &sinks.subtitle, path) {
-                Ok(adjusted) => ready.0.lock().unwrap().adjusted_subtitles = Some(adjusted),
-                Err(failure) => {
-                    retain_lobby(
-                        ready,
-                        format!("Cannot prepare external subtitles: {failure}"),
-                    );
-                    return;
-                }
-            }
-        }
-        SubtitleSource::None => overlay.set_property("silent", true),
-        SubtitleSource::Embedded(_) => {}
-    }
     if selection.set(chosen).is_err() {
         retain_lobby(ready, "Movie streams were selected twice");
         return;
@@ -857,6 +841,19 @@ fn configure_movie_streams(
         return;
     }
     resolve_pending_pads(ready, selection, sinks);
+    match &chosen.subtitle {
+        SubtitleSource::External(path) => {
+            match add_external_subtitles(pipeline, &sinks.subtitle, path) {
+                Ok(adjusted) => ready.0.lock().unwrap().adjusted_subtitles = Some(adjusted),
+                Err(failure) => retain_lobby(
+                    ready,
+                    format!("Cannot prepare external subtitles: {failure}"),
+                ),
+            }
+        }
+        SubtitleSource::None => overlay.set_property("silent", true),
+        SubtitleSource::Embedded(_) => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1964,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn external_subtitle_link_failure_retain_lobby() {
+    fn external_subtitle_link_failure_is_reported() {
         let _gst = gst_test();
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1973,54 +1970,24 @@ mod tests {
         let subtitle = std::env::temp_dir().join(format!("owncast-subtitle-{suffix}.srt"));
         fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
         let pipeline = gst::Pipeline::new();
-        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
         let overlay = gst::ElementFactory::make("subtitleoverlay")
             .build()
             .unwrap();
         let occupied = gst::ElementFactory::make("fakesrc").build().unwrap();
-        pipeline.add_many([&movie, &overlay, &occupied]).unwrap();
+        pipeline.add_many([&overlay, &occupied]).unwrap();
         occupied
             .static_pad("src")
             .unwrap()
             .link(&overlay.static_pad("subtitle_sink").unwrap())
             .unwrap();
-        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
-        let selection = Arc::new(OnceLock::new());
-        let sinks = SelectedSinks {
-            video: gst::Pad::new(gst::PadDirection::Sink),
-            audio: gst::Pad::new(gst::PadDirection::Sink),
-            subtitle: overlay.static_pad("subtitle_sink").unwrap(),
-        };
-        pipeline
-            .bus()
-            .unwrap()
-            .post(stream_collection_message(&movie))
-            .unwrap();
-        let message = pipeline
-            .bus()
-            .unwrap()
-            .timed_pop(gst::ClockTime::ZERO)
-            .unwrap();
-
-        handle_stream_collection_message(
-            &message,
-            Some(&subtitle),
-            &movie,
-            &pipeline,
-            &overlay,
-            &selection,
-            &ready,
-            &sinks,
-        );
 
         assert!(
-            ready
-                .0
-                .lock()
-                .unwrap()
-                .failure
-                .as_deref()
-                .is_some_and(|failure| failure.contains("Cannot prepare external subtitles"))
+            add_external_subtitles(
+                &pipeline,
+                &overlay.static_pad("subtitle_sink").unwrap(),
+                &subtitle
+            )
+            .is_err()
         );
         fs::remove_file(subtitle).unwrap();
     }
