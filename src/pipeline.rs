@@ -256,8 +256,8 @@ impl PipelineParts {
               ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
               ! x264enc name=video_encoder bitrate=6000 key-int-max=60 bframes=0
                   tune=zerolatency speed-preset=medium
-              ! h264parse config-interval=1
-              ! queue
+              ! h264parse name=video_parser config-interval=1
+              ! queue name=video_output_queue
               ! mux.
 
             input-selector name=audio_selector sync-streams=true
@@ -269,8 +269,8 @@ impl PipelineParts {
               ! audiodynamic mode=compressor characteristics=soft-knee
                   threshold=0.125 ratio=2.0
               ! avenc_aac name=audio_encoder bitrate=192000
-              ! aacparse
-              ! queue
+              ! aacparse name=audio_parser
+              ! queue name=audio_output_queue
               ! mux.
 
             flvmux name=mux streamable=true
@@ -286,7 +286,7 @@ impl PipelineParts {
             .build()?;
         pipeline.add(&movie)?;
 
-        let video_bin = gst::parse::bin_from_description(
+        let video_bin = gst::parse::bin_from_description_with_name(
             r#"
             queue name=movie_video_input max-size-buffers=2
               ! videoconvert
@@ -298,6 +298,7 @@ impl PipelineParts {
               ! queue max-size-buffers=2
             "#,
             true,
+            "movie_video",
         )?;
         let movie_video_sink = gst::GhostPad::builder_with_target(
             &video_bin
@@ -309,7 +310,11 @@ impl PipelineParts {
         .name("video_sink")
         .build();
         video_bin.add_pad(&movie_video_sink)?;
-        let audio_bin = gst::parse::bin_from_description("queue max-size-buffers=8", true)?;
+        let audio_bin = gst::parse::bin_from_description_with_name(
+            "queue max-size-buffers=8",
+            true,
+            "movie_audio",
+        )?;
         pipeline.add(&video_bin)?;
         pipeline.add(&audio_bin)?;
 
@@ -379,6 +384,7 @@ struct ReadyState {
     enter_pressed: bool,
     failure: Option<String>,
     pending_pads: Vec<PendingPad>,
+    blocking_probes: Option<BlockingProbes>,
 }
 
 struct PendingPad {
@@ -503,14 +509,18 @@ fn fatal_pipeline_error(
     switched: bool,
 ) -> bool {
     switched
-        || message.src().is_some_and(|source| {
-            ["video_encoder", "audio_encoder", "mux", "output"]
-                .into_iter()
-                .filter_map(|name| pipeline.by_name(name))
-                .any(|element| {
-                    source == element.upcast_ref::<gst::Object>()
-                        || source.has_as_ancestor(&element)
-                })
+        || !message.src().is_some_and(|source| {
+            [
+                "movie",
+                "movie_video",
+                "movie_audio",
+                "movie_external_subtitles",
+            ]
+            .into_iter()
+            .filter_map(|name| pipeline.by_name(name))
+            .any(|element| {
+                source == element.upcast_ref::<gst::Object>() || source.has_as_ancestor(&element)
+            })
         })
 }
 
@@ -558,6 +568,13 @@ impl Drop for BlockingProbes {
     }
 }
 
+fn release_blocking_probes(ready: &Arc<(Mutex<ReadyState>, Condvar)>) {
+    let probes = ready.0.lock().unwrap().blocking_probes.take();
+    if let Some(mut probes) = probes {
+        probes.release();
+    }
+}
+
 fn post_application_error(bus: &gst::Bus, name: &str, failure: impl ToString) {
     let structure = gst::Structure::builder(name)
         .field("error", failure.to_string())
@@ -582,13 +599,57 @@ fn application_failure(message: &gst::MessageRef) -> Option<String> {
     )
 }
 
+fn require_timing(
+    clock: Option<gst::Clock>,
+    base_time: Option<gst::ClockTime>,
+) -> Result<(gst::Clock, gst::ClockTime), String> {
+    Ok((
+        clock.ok_or_else(|| "Pipeline clock is missing".to_owned())?,
+        base_time.ok_or_else(|| "Pipeline base time is missing".to_owned())?,
+    ))
+}
+
+fn pipeline_timing(pipeline: &gst::Pipeline) -> Result<(gst::Clock, gst::ClockTime), String> {
+    require_timing(pipeline.clock(), pipeline.base_time())
+}
+
+fn schedule_clock_callback<F>(
+    clock_id: &gst::SingleShotClockId,
+    bus: &gst::Bus,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    callback: F,
+) -> bool
+where
+    F: FnOnce(&gst::Clock, Option<gst::ClockTime>, &gst::ClockId) + Send + 'static,
+{
+    let callback_ready = ready.clone();
+    match clock_id.wait_async(move |clock, jitter, id| {
+        release_blocking_probes(&callback_ready);
+        callback(clock, jitter, id);
+    }) {
+        Ok(_) => true,
+        Err(failure) => {
+            release_blocking_probes(ready);
+            post_application_error(
+                bus,
+                "owncast-switch-error",
+                format!("Cannot schedule movie handoff: {failure}"),
+            );
+            false
+        }
+    }
+}
+
 fn add_external_subtitles(
     pipeline: &gst::Pipeline,
     overlay: &gst::Element,
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
-    let subtitles =
-        gst::parse::bin_from_description("filesrc name=source ! subparse ! queue", true)?;
+    let subtitles = gst::parse::bin_from_description_with_name(
+        "filesrc name=source ! subparse ! queue",
+        true,
+        "movie_external_subtitles",
+    )?;
     subtitles
         .by_name("source")
         .ok_or_else(|| error("External subtitle source is missing"))?
@@ -604,6 +665,98 @@ fn add_external_subtitles(
         )?;
     subtitles.sync_state_with_parent()?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn configure_movie_streams(
+    candidates: &[StreamCandidate],
+    external: Option<&std::path::Path>,
+    movie: &gst::Element,
+    pipeline: &gst::Pipeline,
+    overlay: &gst::Element,
+    selection: &Arc<OnceLock<Selection>>,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    sinks: &SelectedSinks,
+) {
+    let chosen = match select_streams(candidates, external) {
+        Ok(chosen) => chosen,
+        Err(reason) => {
+            retain_lobby(ready, reason);
+            return;
+        }
+    };
+    match &chosen.subtitle {
+        SubtitleSource::External(path) => {
+            if let Err(failure) = add_external_subtitles(pipeline, overlay, path) {
+                retain_lobby(
+                    ready,
+                    format!("Cannot prepare external subtitles: {failure}"),
+                );
+                return;
+            }
+        }
+        SubtitleSource::None => overlay.set_property("silent", true),
+        SubtitleSource::Embedded(_) => {}
+    }
+    if selection.set(chosen).is_err() {
+        retain_lobby(ready, "Movie streams were selected twice");
+        return;
+    }
+    let chosen = selection.get().unwrap();
+    let ids = [
+        Some(chosen.video_id.as_str()),
+        Some(chosen.audio_id.as_str()),
+        match &chosen.subtitle {
+            SubtitleSource::Embedded(id) => Some(id.as_str()),
+            _ => None,
+        },
+    ]
+    .into_iter()
+    .flatten();
+    if !movie.send_event(gst::event::SelectStreams::new(ids)) {
+        retain_lobby(ready, "Movie rejected selected streams");
+        return;
+    }
+    resolve_pending_pads(ready, selection, sinks);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_stream_collection_message(
+    message: &gst::MessageRef,
+    external: Option<&std::path::Path>,
+    movie: &gst::Element,
+    pipeline: &gst::Pipeline,
+    overlay: &gst::Element,
+    selection: &Arc<OnceLock<Selection>>,
+    ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    sinks: &SelectedSinks,
+) -> bool {
+    let gst::MessageView::StreamCollection(collection) = message.view() else {
+        return false;
+    };
+    if selection.get().is_some()
+        || !message.src().is_some_and(|source| {
+            source == movie.upcast_ref::<gst::Object>() || source.has_as_ancestor(movie)
+        })
+    {
+        return false;
+    }
+    let candidates: Vec<_> = collection
+        .stream_collection()
+        .iter()
+        .filter_map(|stream| candidate(&stream))
+        .collect();
+    configure_movie_streams(
+        &candidates,
+        external,
+        movie,
+        pipeline,
+        overlay,
+        selection,
+        ready,
+        sinks,
+    );
+    true
 }
 
 pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
@@ -640,6 +793,10 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
             },
         )
         .ok_or_else(|| error("Cannot block movie audio"))?;
+    ready.0.lock().unwrap().blocking_probes = Some(BlockingProbes {
+        video: Some((parts.movie_video_src.clone(), video_probe)),
+        audio: Some((parts.movie_audio_src.clone(), audio_probe)),
+    });
 
     let sinks = SelectedSinks {
         video: parts.movie_video_sink.clone(),
@@ -680,17 +837,11 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let audio_selector = parts.audio_selector.clone();
     let movie_video_pad = parts.movie_video_pad.clone();
     let movie_audio_pad = parts.movie_audio_pad.clone();
-    let movie_video_src = parts.movie_video_src.clone();
-    let movie_audio_src = parts.movie_audio_src.clone();
     let switch_bus = bus.clone();
     let title = config.title.clone();
     let title_token = config.title_token.clone();
     let switch_flag = switched.clone();
     thread::spawn(move || {
-        let mut probes = BlockingProbes {
-            video: Some((movie_video_src, video_probe)),
-            audio: Some((movie_audio_src, audio_probe)),
-        };
         let mut state = switch_ready.0.lock().unwrap();
         while (state.video_pts.is_none() || state.audio_pts.is_none() || !state.enter_pressed)
             && state.failure.is_none()
@@ -698,50 +849,37 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
             state = switch_ready.1.wait(state).unwrap();
         }
         if state.failure.is_some() {
+            drop(state);
+            release_blocking_probes(&switch_ready);
             return;
         }
         let video_pts = state.video_pts.unwrap();
         let audio_pts = state.audio_pts.unwrap();
         drop(state);
 
-        let Some(clock) = switch_pipeline.clock() else {
-            post_application_error(
-                &switch_bus,
-                "owncast-switch-error",
-                "Pipeline clock is missing",
-            );
-            return;
-        };
-        let Some(base_time) = switch_pipeline.base_time() else {
-            post_application_error(
-                &switch_bus,
-                "owncast-switch-error",
-                "Pipeline base time is missing",
-            );
-            return;
+        let (clock, base_time) = match pipeline_timing(&switch_pipeline) {
+            Ok(timing) => timing,
+            Err(failure) => {
+                release_blocking_probes(&switch_ready);
+                post_application_error(&switch_bus, "owncast-switch-error", failure);
+                return;
+            }
         };
         let boundary = next_frame_boundary(clock.time().saturating_sub(base_time));
         movie_video_pad.set_offset(running_time_offset(boundary, video_pts));
         movie_audio_pad.set_offset(running_time_offset(boundary, audio_pts));
         let clock_id = clock.new_single_shot_id(base_time + boundary);
-        let schedule_bus = switch_bus.clone();
-        if let Err(failure) = clock_id.wait_async(move |_, _, _| {
+        let callback_bus = switch_bus.clone();
+        schedule_clock_callback(&clock_id, &switch_bus, &switch_ready, move |_, _, _| {
             video_selector.set_property("active-pad", Some(&movie_video_pad));
             audio_selector.set_property("active-pad", Some(&movie_audio_pad));
-            probes.release();
             switch_flag.store(true, Ordering::Release);
             if let Err(failure) = set_title(&title_token, &title) {
-                post_application_error(&switch_bus, "owncast-title-error", failure);
+                post_application_error(&callback_bus, "owncast-title-error", failure);
                 return;
             }
             println!("Movie is live.");
-        }) {
-            post_application_error(
-                &schedule_bus,
-                "owncast-switch-error",
-                format!("Cannot schedule movie handoff: {failure}"),
-            );
-        }
+        });
     });
 
     let _signal = register_sigint(&bus)?;
@@ -754,65 +892,19 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
             continue;
         };
+        if handle_stream_collection_message(
+            &message,
+            config.subtitles.as_deref(),
+            &parts.movie,
+            &parts.pipeline,
+            &parts.subtitle_overlay,
+            &selection,
+            &ready,
+            &sinks,
+        ) {
+            continue;
+        }
         match message.view() {
-            gst::MessageView::StreamCollection(collection)
-                if selection.get().is_none()
-                    && message
-                        .src()
-                        .is_some_and(|source| source.has_as_ancestor(&parts.movie)) =>
-            {
-                let candidates: Vec<_> = collection
-                    .stream_collection()
-                    .iter()
-                    .filter_map(|stream| candidate(&stream))
-                    .collect();
-                match select_streams(&candidates, config.subtitles.as_deref()) {
-                    Ok(chosen) => {
-                        match &chosen.subtitle {
-                            SubtitleSource::External(path) => {
-                                if let Err(failure) = add_external_subtitles(
-                                    &parts.pipeline,
-                                    &parts.subtitle_overlay,
-                                    path,
-                                ) {
-                                    retain_lobby(
-                                        &ready,
-                                        format!("Cannot prepare external subtitles: {failure}"),
-                                    );
-                                    continue;
-                                }
-                            }
-                            SubtitleSource::None => {
-                                parts.subtitle_overlay.set_property("silent", true);
-                            }
-                            SubtitleSource::Embedded(_) => {}
-                        }
-                        if selection.set(chosen).is_err() {
-                            retain_lobby(&ready, "Movie streams were selected twice");
-                            continue;
-                        }
-                        let chosen = selection.get().unwrap();
-                        let ids = [
-                            Some(chosen.video_id.as_str()),
-                            Some(chosen.audio_id.as_str()),
-                            match &chosen.subtitle {
-                                SubtitleSource::Embedded(id) => Some(id.as_str()),
-                                _ => None,
-                            },
-                        ]
-                        .into_iter()
-                        .flatten();
-                        if !parts.movie.send_event(gst::event::SelectStreams::new(ids)) {
-                            retain_lobby(&ready, "Movie rejected selected streams");
-                            continue;
-                        }
-                        resolve_pending_pads(&ready, &selection, &sinks);
-                    }
-                    Err(reason) => {
-                        retain_lobby(&ready, reason);
-                    }
-                }
-            }
             gst::MessageView::Error(_) => {
                 let failure = bus_error(&message).unwrap();
                 if fatal_pipeline_error(&message, &parts.pipeline, switched.load(Ordering::Acquire))
@@ -841,7 +933,49 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use gst::glib::translate::FromGlib;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::mpsc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn linked_pads() -> (gst::Pad, gst::Pad) {
+        let source = gst::Pad::new(gst::PadDirection::Src);
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .chain_function(|_, _, _| Ok(gst::FlowSuccess::Ok))
+            .build();
+        source.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        source.link(&sink).unwrap();
+        source.push_event(gst::event::StreamStart::new("test"));
+        let segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        source.push_event(gst::event::Segment::new(segment.as_ref()));
+        (source, sink)
+    }
+
+    fn stream_collection_message(movie: &gst::Element) -> gst::Message {
+        let collection = gst::StreamCollection::builder(None)
+            .streams([
+                gst::Stream::new(
+                    Some("video"),
+                    None,
+                    gst::StreamType::VIDEO,
+                    gst::StreamFlags::SELECT,
+                ),
+                gst::Stream::new(
+                    Some("audio"),
+                    None,
+                    gst::StreamType::AUDIO,
+                    gst::StreamFlags::SELECT,
+                ),
+            ])
+            .build();
+        gst::message::StreamCollection::builder(&collection)
+            .src(movie)
+            .build()
+    }
 
     #[test]
     fn rebases_first_movie_pts_to_boundary() {
@@ -942,7 +1076,7 @@ mod tests {
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let movie_branch = gst::ElementFactory::make("fakesrc")
-            .name("movie-branch")
+            .name("movie_video")
             .build()
             .unwrap();
         let output = gst::ElementFactory::make("fakesink")
@@ -960,6 +1094,35 @@ mod tests {
         assert!(!fatal_pipeline_error(&branch_error, &pipeline, false));
         assert!(fatal_pipeline_error(&output_error, &pipeline, false));
         assert!(fatal_pipeline_error(&branch_error, &pipeline, true));
+    }
+
+    #[test]
+    fn parsers_and_post_encoder_queues_are_fatal_before_handoff() {
+        gst::init().unwrap();
+        let config = Config {
+            video: PathBuf::from("/tmp/movie.mkv"),
+            subtitles: None,
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
+
+        for name in [
+            "video_parser",
+            "video_output_queue",
+            "audio_parser",
+            "audio_output_queue",
+        ] {
+            let source = parts.pipeline.by_name(name).unwrap();
+            let message = gst::message::Error::builder(gst::StreamError::Failed, "common failed")
+                .src(&source)
+                .build();
+            assert!(
+                fatal_pipeline_error(&message, &parts.pipeline, false),
+                "{name} must be fatal"
+            );
+        }
     }
 
     #[test]
@@ -1029,6 +1192,19 @@ mod tests {
     }
 
     #[test]
+    fn signal_guard_removes_registered_source() {
+        gst::init().unwrap();
+        let context = gst::glib::MainContext::default();
+        let guard = register_sigint(&gst::Bus::new()).unwrap();
+        let source_id = unsafe { gst::glib::SourceId::from_glib(guard.id) };
+        assert!(context.find_source_by_id(&source_id).is_some());
+
+        drop(guard);
+
+        assert!(context.find_source_by_id(&source_id).is_none());
+    }
+
+    #[test]
     fn sigint_callback_does_not_panic_when_bus_rejects_message() {
         gst::init().unwrap();
         let removed = Arc::new(AtomicBool::new(false));
@@ -1060,6 +1236,175 @@ mod tests {
             .build();
             assert_eq!(application_failure(&message).as_deref(), Some(failure));
         }
+    }
+
+    #[test]
+    fn missing_pipeline_clock_and_base_time_are_reported() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        assert_eq!(
+            pipeline_timing(&pipeline).unwrap_err(),
+            "Pipeline clock is missing"
+        );
+        assert_eq!(
+            require_timing(Some(gst::SystemClock::obtain().upcast()), None).unwrap_err(),
+            "Pipeline base time is missing"
+        );
+    }
+
+    #[test]
+    fn rejected_clock_callback_releases_real_blocking_probes() {
+        gst::init().unwrap();
+        let (video_src, _video_sink) = linked_pads();
+        let (audio_src, _audio_sink) = linked_pads();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        ready.0.lock().unwrap().blocking_probes = Some(BlockingProbes {
+            video: Some((
+                video_src.clone(),
+                video_src
+                    .add_probe(
+                        gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
+                        |_, _| gst::PadProbeReturn::Ok,
+                    )
+                    .unwrap(),
+            )),
+            audio: Some((
+                audio_src.clone(),
+                audio_src
+                    .add_probe(
+                        gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
+                        |_, _| gst::PadProbeReturn::Ok,
+                    )
+                    .unwrap(),
+            )),
+        });
+        let clock = gst::SystemClock::obtain();
+        let clock_id = clock.new_single_shot_id(clock.time() + gst::ClockTime::from_seconds(5));
+        clock_id.unschedule();
+        let bus = gst::Bus::new();
+
+        assert!(!schedule_clock_callback(
+            &clock_id,
+            &bus,
+            &ready,
+            |_, _, _| {}
+        ));
+        let failure = bus.timed_pop(gst::ClockTime::ZERO).unwrap();
+        assert!(
+            application_failure(&failure)
+                .unwrap()
+                .contains("Cannot schedule movie handoff")
+        );
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            sent.send((
+                video_src.push(gst::Buffer::new()),
+                audio_src.push(gst::Buffer::new()),
+            ))
+            .unwrap();
+        });
+        let (video, audio) = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(video.is_ok());
+        assert!(audio.is_ok());
+    }
+
+    #[test]
+    fn stream_setup_rejections_retain_lobby() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let overlay = gst::ElementFactory::make("subtitleoverlay")
+            .build()
+            .unwrap();
+        pipeline.add_many([&movie, &overlay]).unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let selection = Arc::new(OnceLock::new());
+        let sinks = SelectedSinks {
+            video: gst::Pad::new(gst::PadDirection::Sink),
+            audio: gst::Pad::new(gst::PadDirection::Sink),
+            subtitle: overlay.static_pad("subtitle_sink").unwrap(),
+        };
+        pipeline
+            .bus()
+            .unwrap()
+            .post(stream_collection_message(&movie))
+            .unwrap();
+        let message = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop(gst::ClockTime::ZERO)
+            .unwrap();
+
+        handle_stream_collection_message(
+            &message, None, &movie, &pipeline, &overlay, &selection, &ready, &sinks,
+        );
+
+        assert_eq!(
+            ready.0.lock().unwrap().failure.as_deref(),
+            Some("Movie rejected selected streams")
+        );
+    }
+
+    #[test]
+    fn external_subtitle_link_failure_retain_lobby() {
+        gst::init().unwrap();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let subtitle = std::env::temp_dir().join(format!("owncast-subtitle-{suffix}.srt"));
+        fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nHello\n").unwrap();
+        let pipeline = gst::Pipeline::new();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let overlay = gst::ElementFactory::make("subtitleoverlay")
+            .build()
+            .unwrap();
+        let occupied = gst::ElementFactory::make("fakesrc").build().unwrap();
+        pipeline.add_many([&movie, &overlay, &occupied]).unwrap();
+        occupied
+            .static_pad("src")
+            .unwrap()
+            .link(&overlay.static_pad("subtitle_sink").unwrap())
+            .unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        let selection = Arc::new(OnceLock::new());
+        let sinks = SelectedSinks {
+            video: gst::Pad::new(gst::PadDirection::Sink),
+            audio: gst::Pad::new(gst::PadDirection::Sink),
+            subtitle: overlay.static_pad("subtitle_sink").unwrap(),
+        };
+        pipeline
+            .bus()
+            .unwrap()
+            .post(stream_collection_message(&movie))
+            .unwrap();
+        let message = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop(gst::ClockTime::ZERO)
+            .unwrap();
+
+        handle_stream_collection_message(
+            &message,
+            Some(&subtitle),
+            &movie,
+            &pipeline,
+            &overlay,
+            &selection,
+            &ready,
+            &sinks,
+        );
+
+        assert!(
+            ready
+                .0
+                .lock()
+                .unwrap()
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("Cannot prepare external subtitles"))
+        );
+        fs::remove_file(subtitle).unwrap();
     }
 
     #[test]
