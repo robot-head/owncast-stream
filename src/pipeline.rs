@@ -617,6 +617,7 @@ fn schedule_clock_callback<F, G>(
     clock_id: &gst::SingleShotClockId,
     bus: &gst::Bus,
     ready: &Arc<(Mutex<ReadyState>, Condvar)>,
+    switched: &Arc<AtomicBool>,
     callback: F,
     after_release: G,
 ) -> bool
@@ -625,8 +626,10 @@ where
     G: FnOnce() + Send + 'static,
 {
     let callback_ready = ready.clone();
+    let callback_switched = switched.clone();
     match clock_id.wait_async(move |clock, jitter, id| {
         callback(clock, jitter, id);
+        callback_switched.store(true, Ordering::Release);
         release_blocking_probes(&callback_ready);
         after_release();
     }) {
@@ -877,12 +880,12 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
             &clock_id,
             &switch_bus,
             &switch_ready,
+            &switch_flag,
             move |_, _, _| {
                 video_selector.set_property("active-pad", Some(&movie_video_pad));
                 audio_selector.set_property("active-pad", Some(&movie_audio_pad));
             },
             move || {
-                switch_flag.store(true, Ordering::Release);
                 if let Err(failure) = set_title(&title_token, &title) {
                     post_application_error(&callback_bus, "owncast-title-error", failure);
                     return;
@@ -1292,14 +1295,17 @@ mod tests {
         let clock_id = clock.new_single_shot_id(clock.time() + gst::ClockTime::from_seconds(5));
         clock_id.unschedule();
         let bus = gst::Bus::new();
+        let switched = Arc::new(AtomicBool::new(false));
 
         assert!(!schedule_clock_callback(
             &clock_id,
             &bus,
             &ready,
+            &switched,
             |_, _, _| {},
             || {},
         ));
+        assert!(!switched.load(Ordering::Acquire));
         let failure = bus.timed_pop(gst::ClockTime::ZERO).unwrap();
         assert!(
             application_failure(&failure)
@@ -1376,11 +1382,14 @@ mod tests {
         let movie_audio_pad = parts.movie_audio_pad.clone();
         let (order_tx, order_rx) = mpsc::channel();
         let title_ready = ready.clone();
+        let switched = Arc::new(AtomicBool::new(false));
+        let title_switched = switched.clone();
         let (title_tx, title_rx) = mpsc::channel();
         assert!(schedule_clock_callback(
             &clock_id,
             &gst::Bus::new(),
             &ready,
+            &switched,
             move |_, _, _| {
                 let video_was_blocked = callback_ready.0.lock().unwrap().blocking_probes.is_some();
                 video_selector.set_property("active-pad", Some(&movie_video_pad));
@@ -1393,7 +1402,10 @@ mod tests {
             },
             move || {
                 title_tx
-                    .send(title_ready.0.lock().unwrap().blocking_probes.is_some())
+                    .send((
+                        title_ready.0.lock().unwrap().blocking_probes.is_some(),
+                        title_switched.load(Ordering::Acquire),
+                    ))
                     .unwrap();
             },
         ));
@@ -1404,7 +1416,12 @@ mod tests {
             video_was_blocked && audio_was_blocked && both_were_blocked,
             "both selector assignments must precede probe release"
         );
-        let title_was_blocked = title_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (title_was_blocked, switched_before_title) =
+            title_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            switched_before_title,
+            "shared switched state must precede probe release"
+        );
         assert!(!title_was_blocked, "probe release must precede title work");
         assert!(
             flow_rx
