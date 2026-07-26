@@ -5,10 +5,12 @@ use std::{
     env,
     error::Error,
     ffi::c_void,
-    io,
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
@@ -171,7 +173,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "textoverlay",
     "subtitleoverlay",
     "subparse",
-    "appsrc",
+    "filesrc",
     "queue",
     "input-selector",
     "videoconvert",
@@ -758,28 +760,48 @@ fn add_external_subtitles(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
     let contents = advance_srt(&std::fs::read_to_string(path)?).map_err(error)?;
+    let adjusted = write_adjusted_subtitles(&contents)?;
     let subtitles = gst::parse::bin_from_description_with_name(
-        "appsrc name=source format=bytes ! subparse ! queue",
+        "filesrc name=source ! subparse ! queue",
         true,
         "movie_external_subtitles",
     )?;
-    let source = subtitles
+    subtitles
         .by_name("source")
-        .ok_or_else(|| error("External subtitle source is missing"))?;
-    source.set_property("caps", gst::Caps::builder("application/x-subtitle").build());
+        .ok_or_else(|| error("External subtitle source is missing"))?
+        .set_property("location", &adjusted.0);
     pipeline.add(&subtitles)?;
     let output = subtitles
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?;
     output.link(sink)?;
-    let mut buffer = gst::Buffer::from_mut_slice(contents.into_bytes());
-    if source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&mut buffer]) != gst::FlowReturn::Ok
-        || source.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]) != gst::FlowReturn::Ok
-    {
-        return Err(error("Cannot feed external subtitles"));
-    }
     subtitles.sync_state_with_parent()?;
     Ok(())
+}
+
+static SUBTITLE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct AdjustedSubtitles(PathBuf);
+
+impl Drop for AdjustedSubtitles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_adjusted_subtitles(contents: &str) -> Result<AdjustedSubtitles, Box<dyn Error>> {
+    let sequence = SUBTITLE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = env::temp_dir().join(format!(
+        "owncast-stream-subtitles-{}-{sequence}.srt",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(AdjustedSubtitles(path))
 }
 
 fn parse_srt_timestamp(value: &str) -> Result<u64, String> {
@@ -1602,7 +1624,7 @@ mod tests {
                 .by_name("source")
                 .unwrap()
                 .factory()
-                .is_some_and(|factory| factory.name() == "appsrc")
+                .is_some_and(|factory| factory.name() == "filesrc")
         );
         fs::remove_file(subtitle).unwrap();
     }
