@@ -772,13 +772,13 @@ fn add_external_subtitles(
         .static_pad("src")
         .ok_or_else(|| error("External subtitle output is missing"))?;
     output.link(sink)?;
-    subtitles.sync_state_with_parent()?;
     let mut buffer = gst::Buffer::from_mut_slice(contents.into_bytes());
     if source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&mut buffer]) != gst::FlowReturn::Ok
         || source.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]) != gst::FlowReturn::Ok
     {
         return Err(error("Cannot feed external subtitles"));
     }
+    subtitles.sync_state_with_parent()?;
     Ok(())
 }
 
