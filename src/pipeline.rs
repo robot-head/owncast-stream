@@ -624,8 +624,8 @@ where
 {
     let callback_ready = ready.clone();
     match clock_id.wait_async(move |clock, jitter, id| {
-        release_blocking_probes(&callback_ready);
         callback(clock, jitter, id);
+        release_blocking_probes(&callback_ready);
     }) {
         Ok(_) => true,
         Err(failure) => {
@@ -1306,6 +1306,98 @@ mod tests {
         let (video, audio) = received.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(video.is_ok());
         assert!(audio.is_ok());
+    }
+
+    #[test]
+    fn successful_clock_callback_switches_both_selectors_before_releasing_probes() {
+        gst::init().unwrap();
+        let config = Config {
+            video: PathBuf::from("/tmp/movie.mkv"),
+            subtitles: None,
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
+        let (video_src, _video_sink) = linked_pads();
+        let (audio_src, _audio_sink) = linked_pads();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let video_blocked = blocked_tx.clone();
+        let video_probe = video_src
+            .add_probe(
+                gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
+                move |_, _| {
+                    video_blocked.send(()).unwrap();
+                    gst::PadProbeReturn::Ok
+                },
+            )
+            .unwrap();
+        let audio_probe = audio_src
+            .add_probe(
+                gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::BUFFER,
+                move |_, _| {
+                    blocked_tx.send(()).unwrap();
+                    gst::PadProbeReturn::Ok
+                },
+            )
+            .unwrap();
+        let ready = Arc::new((Mutex::new(ReadyState::default()), Condvar::new()));
+        ready.0.lock().unwrap().blocking_probes = Some(BlockingProbes {
+            video: Some((video_src.clone(), video_probe)),
+            audio: Some((audio_src.clone(), audio_probe)),
+        });
+        let (flow_tx, flow_rx) = mpsc::channel();
+        for source in [video_src, audio_src] {
+            let flow_tx = flow_tx.clone();
+            std::thread::spawn(move || {
+                flow_tx.send(source.push(gst::Buffer::new())).unwrap();
+            });
+        }
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let clock = gst::SystemClock::obtain();
+        let clock_id = clock.new_single_shot_id(clock.time());
+        let callback_ready = ready.clone();
+        let video_selector = parts.video_selector.clone();
+        let audio_selector = parts.audio_selector.clone();
+        let movie_video_pad = parts.movie_video_pad.clone();
+        let movie_audio_pad = parts.movie_audio_pad.clone();
+        let (order_tx, order_rx) = mpsc::channel();
+        assert!(schedule_clock_callback(
+            &clock_id,
+            &gst::Bus::new(),
+            &ready,
+            move |_, _, _| {
+                let video_was_blocked = callback_ready.0.lock().unwrap().blocking_probes.is_some();
+                video_selector.set_property("active-pad", Some(&movie_video_pad));
+                let audio_was_blocked = callback_ready.0.lock().unwrap().blocking_probes.is_some();
+                audio_selector.set_property("active-pad", Some(&movie_audio_pad));
+                let both_were_blocked = callback_ready.0.lock().unwrap().blocking_probes.is_some();
+                order_tx
+                    .send((video_was_blocked, audio_was_blocked, both_were_blocked))
+                    .unwrap();
+            }
+        ));
+
+        let (video_was_blocked, audio_was_blocked, both_were_blocked) =
+            order_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            video_was_blocked && audio_was_blocked && both_were_blocked,
+            "both selector assignments must precede probe release"
+        );
+        assert!(
+            flow_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            flow_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
     }
 
     #[test]
