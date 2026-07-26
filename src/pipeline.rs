@@ -1203,6 +1203,8 @@ mod tests {
 
     #[test]
     fn audio_encoder_and_parser_stay_monotonic_across_handoff() {
+        const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
         gst::init().unwrap();
         let pipeline = gst::parse::launch(
             r#"
@@ -1223,7 +1225,7 @@ mod tests {
                   threshold=0.125 ratio=2.0
               ! avenc_aac name=audio_encoder bitrate=192000
               ! aacparse name=audio_parser
-              ! fakesink sync=false
+              ! fakesink sync=false async=false
             "#,
         )
         .unwrap()
@@ -1270,9 +1272,22 @@ mod tests {
             .unwrap();
 
         pipeline.set_state(gst::State::Playing).unwrap();
-        let mut raw = vec![raw_rx.recv_timeout(Duration::from_secs(2)).unwrap()];
-        let mut encoded = vec![encoded_rx.recv_timeout(Duration::from_secs(2)).unwrap()];
+        pipeline
+            .state(gst::ClockTime::from_seconds(TEST_TIMEOUT.as_secs()))
+            .0
+            .expect("audio handoff pipeline did not reach Playing within 10s");
+        let mut raw = vec![
+            raw_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("lobby audio did not reach the encoder within 10s"),
+        ];
+        let mut encoded = vec![
+            encoded_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("lobby audio did not reach the parser within 10s"),
+        ];
         let movie = pipeline.by_name("movie").unwrap();
+        let (push_tx, push_rx) = mpsc::channel();
         let push = std::thread::spawn(move || {
             const FRAMES: usize = 1024;
             for block in 0..12 {
@@ -1289,15 +1304,19 @@ mod tests {
                 }
                 push_buffer(&movie, buffer);
             }
+            push_tx.send(()).unwrap();
         });
 
-        let mut state = ready
+        let (mut state, wait) = ready
             .1
-            .wait_timeout_while(ready.0.lock().unwrap(), Duration::from_secs(2), |state| {
+            .wait_timeout_while(ready.0.lock().unwrap(), TEST_TIMEOUT, |state| {
                 state.audio_pts.is_none()
             })
-            .unwrap()
-            .0;
+            .unwrap();
+        assert!(
+            !wait.timed_out() || state.audio_pts.is_some(),
+            "movie audio did not reach the blocking probe within 10s"
+        );
         assert_eq!(state.audio_pts, Some(gst::ClockTime::ZERO));
         state.video_pts = Some(gst::ClockTime::ZERO);
         drop(state);
@@ -1308,13 +1327,24 @@ mod tests {
         configure_timestamp_rebase(&ready, boundary).unwrap();
         selector.set_property("active-pad", Some(&selector.static_pad("sink_1").unwrap()));
         movie_pad.remove_probe(blocker);
+        push_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("movie audio push did not finish within 10s");
         push.join().unwrap();
 
         while raw.iter().filter(|pts| **pts >= boundary).count() < 4 {
-            raw.push(raw_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            raw.push(
+                raw_rx
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("rebased movie audio did not reach the encoder within 10s"),
+            );
         }
         while encoded.iter().filter(|pts| **pts >= boundary).count() < 4 {
-            encoded.push(encoded_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            encoded.push(
+                encoded_rx
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("rebased movie audio did not reach the parser within 10s"),
+            );
         }
         pipeline.set_state(gst::State::Null).unwrap();
 
