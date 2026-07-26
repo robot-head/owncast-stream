@@ -11,3 +11,18 @@ fn usage_errors_exit_with_status_two() {
         "Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]\n"
     );
 }
+
+#[test]
+fn media_path_has_no_subprocess_calls() {
+    let sources = concat!(
+        include_str!("../src/main.rs"),
+        include_str!("../src/pipeline.rs"),
+        include_str!("../src/media.rs"),
+    );
+    for forbidden in ["Command::new", "std::process::Command", "ffprobe", "ffmpeg"] {
+        assert!(
+            !sources.contains(forbidden),
+            "media source contains forbidden subprocess call: {forbidden}"
+        );
+    }
+}

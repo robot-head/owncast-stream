@@ -1598,4 +1598,354 @@ mod tests {
             "sink_0"
         );
     }
+
+    fn appsrc(name: &str, caps: gst::Caps) -> gst::Element {
+        gst::ElementFactory::make("appsrc")
+            .name(name)
+            .property("caps", caps)
+            .property("format", gst::Format::Time)
+            .property("block", true)
+            .build()
+            .unwrap()
+    }
+
+    fn push_buffer(source: &gst::Element, mut buffer: gst::Buffer) {
+        assert_eq!(
+            source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&mut buffer]),
+            gst::FlowReturn::Ok
+        );
+    }
+
+    fn end_stream(source: &gst::Element) {
+        assert_eq!(
+            source.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]),
+            gst::FlowReturn::Ok
+        );
+    }
+
+    fn write_synthetic_flv(path: &std::path::Path) {
+        const WIDTH: usize = 320;
+        const HEIGHT: usize = 180;
+        const FRAME_NS: u64 = 1_000_000_000 / 30;
+        const BEEP_START_NS: u64 = 1_000_000_000;
+
+        let config = Config {
+            video: PathBuf::from("/tmp/synthetic-movie.mkv"),
+            subtitles: None,
+            title: String::new(),
+            stream_key: String::new(),
+            title_token: String::new(),
+        };
+        let parts = PipelineParts::build_with_sink(&config, "filesink").unwrap();
+        parts.pipeline.remove(&parts.movie).unwrap();
+        parts
+            .pipeline
+            .by_name("output")
+            .unwrap()
+            .set_property("location", path);
+        parts
+            .pipeline
+            .by_name("mux")
+            .unwrap()
+            .set_property("streamable", false);
+        for element in parts.pipeline.iterate_elements() {
+            let element = element.unwrap();
+            if element
+                .factory()
+                .is_some_and(|factory| factory.name() == "textoverlay")
+            {
+                element.set_property("text", "");
+            }
+        }
+
+        let video = appsrc(
+            "synthetic_video",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .field("width", WIDTH as i32)
+                .field("height", HEIGHT as i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .build(),
+        );
+        let audio = appsrc(
+            "synthetic_audio",
+            gst::Caps::builder("audio/x-raw")
+                .field("format", "F32LE")
+                .field("layout", "interleaved")
+                .field("rate", 48_000_i32)
+                .field("channels", 2_i32)
+                .build(),
+        );
+        let subtitles = appsrc(
+            "synthetic_subtitles",
+            gst::Caps::builder("text/x-raw")
+                .field("format", "utf8")
+                .build(),
+        );
+        parts
+            .pipeline
+            .add_many([&video, &audio, &subtitles])
+            .unwrap();
+        video
+            .static_pad("src")
+            .unwrap()
+            .link(&parts.movie_video_sink)
+            .unwrap();
+        audio
+            .static_pad("src")
+            .unwrap()
+            .link(&parts.movie_audio_sink)
+            .unwrap();
+        subtitles
+            .link(
+                &parts
+                    .subtitle_overlay
+                    .parent()
+                    .unwrap()
+                    .downcast::<gst::Element>()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (lobby_tx, lobby_rx) = mpsc::channel();
+        let (audio_eos_tx, audio_eos_rx) = mpsc::channel();
+        for queue in ["video_output_queue", "audio_output_queue"] {
+            let lobby_tx = lobby_tx.clone();
+            let seen = Arc::new(AtomicBool::new(false));
+            parts
+                .pipeline
+                .by_name(queue)
+                .unwrap()
+                .static_pad("src")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                    if !seen.swap(true, Ordering::Relaxed) && info.buffer().is_some() {
+                        lobby_tx.send(()).unwrap();
+                    }
+                    gst::PadProbeReturn::Ok
+                })
+                .unwrap();
+        }
+        parts
+            .pipeline
+            .by_name("audio_output_queue")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if matches!(
+                    info.event().map(|event| event.view()),
+                    Some(gst::EventView::Eos(_))
+                ) {
+                    audio_eos_tx.send(()).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        parts.pipeline.set_state(gst::State::Playing).unwrap();
+        for _ in 0..2 {
+            lobby_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+        let (clock, base_time) = pipeline_timing(&parts.pipeline).unwrap();
+        let boundary = next_frame_boundary(clock.time() - base_time);
+        parts.movie_video_src.set_offset(boundary.nseconds() as i64);
+        parts.movie_audio_src.set_offset(boundary.nseconds() as i64);
+        parts
+            .video_selector
+            .set_property("active-pad", Some(&parts.movie_video_pad));
+        parts
+            .audio_selector
+            .set_property("active-pad", Some(&parts.movie_audio_pad));
+
+        let mut subtitle = gst::Buffer::from_mut_slice(b"SYNC".to_vec());
+        {
+            let subtitle = subtitle.get_mut().unwrap();
+            subtitle.set_pts(gst::ClockTime::from_seconds(1));
+            subtitle.set_duration(gst::ClockTime::from_mseconds(700));
+        }
+        push_buffer(&subtitles, subtitle);
+        end_stream(&subtitles);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for frame in 0..60 {
+                    let y = if frame < 30 { 16 } else { 80 };
+                    let mut buffer = gst::Buffer::with_size(WIDTH * HEIGHT * 3 / 2).unwrap();
+                    {
+                        let buffer = buffer.get_mut().unwrap();
+                        buffer.set_pts(gst::ClockTime::from_nseconds(frame * FRAME_NS));
+                        buffer.set_duration(gst::ClockTime::from_nseconds(FRAME_NS));
+                        let mut map = buffer.map_writable().unwrap();
+                        let pixels = map.as_mut_slice();
+                        pixels[..WIDTH * HEIGHT].fill(y);
+                        pixels[WIDTH * HEIGHT..].fill(128);
+                    }
+                    push_buffer(&video, buffer);
+                }
+            });
+            scope.spawn(|| {
+                const AUDIO_FRAMES: usize = 96_000;
+                const AUDIO_BLOCK: usize = 1024;
+                for start in (0..AUDIO_FRAMES).step_by(AUDIO_BLOCK) {
+                    let frames = AUDIO_BLOCK.min(AUDIO_FRAMES - start);
+                    let mut buffer = gst::Buffer::with_size(frames * 2 * size_of::<f32>()).unwrap();
+                    {
+                        let buffer = buffer.get_mut().unwrap();
+                        buffer.set_pts(gst::ClockTime::from_nseconds(
+                            start as u64 * 1_000_000_000 / 48_000,
+                        ));
+                        buffer.set_duration(gst::ClockTime::from_nseconds(
+                            frames as u64 * 1_000_000_000 / 48_000,
+                        ));
+                        let mut map = buffer.map_writable().unwrap();
+                        for (sample, bytes) in map.as_mut_slice().chunks_exact_mut(4).enumerate() {
+                            let frame = start + sample / 2;
+                            let value = if frame as u64 * 1_000_000_000 / 48_000 >= BEEP_START_NS {
+                                (2.0 * std::f32::consts::PI * 1_000.0 * frame as f32 / 48_000.0)
+                                    .sin()
+                                    * 0.5
+                            } else {
+                                0.0
+                            };
+                            bytes.copy_from_slice(&value.to_le_bytes());
+                        }
+                    }
+                    push_buffer(&audio, buffer);
+                }
+            });
+        });
+        end_stream(&audio);
+        audio_eos_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        end_stream(&video);
+
+        let bus = parts.pipeline.bus().unwrap();
+        loop {
+            let message = bus.timed_pop(gst::ClockTime::from_seconds(30)).unwrap();
+            match message.view() {
+                gst::MessageView::Eos(_) => break,
+                gst::MessageView::Error(error) => panic!(
+                    "synthetic encode failed: {} ({})",
+                    error.error(),
+                    error.debug().unwrap_or_default()
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SyncPoints {
+        video: Option<gst::ClockTime>,
+        audio: Option<gst::ClockTime>,
+        subtitle: Option<gst::ClockTime>,
+    }
+
+    fn decode_sync_points(path: &std::path::Path) -> SyncPoints {
+        let pipeline = gst::parse::launch(&format!(
+            r#"
+            uridecodebin uri="{}" name=decode
+            decode. ! queue ! videoconvert ! videoscale
+              ! video/x-raw,format=GRAY8,width=320,height=180
+              ! fakesink name=video_sink sync=false
+            decode. ! queue ! audioconvert ! audioresample
+              ! audio/x-raw,format=F32LE,rate=48000,channels=1
+              ! fakesink name=audio_sink sync=false
+            "#,
+            gst::glib::filename_to_uri(path, None).unwrap()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let points = Arc::new(Mutex::new(SyncPoints::default()));
+        let video_points = points.clone();
+        pipeline
+            .by_name("video_sink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(buffer) = info.buffer() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(pts) = buffer.pts() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let map = buffer.map_readable().unwrap();
+                let pixels = map.as_slice();
+                let mut points = video_points.lock().unwrap();
+                if points.video.is_none() && pixels.first().is_some_and(|pixel| *pixel > 40) {
+                    points.video = Some(pts);
+                }
+                if points.subtitle.is_none() && pixels.iter().any(|pixel| *pixel > 180) {
+                    points.subtitle = Some(pts);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        let audio_points = points.clone();
+        pipeline
+            .by_name("audio_sink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                let Some(buffer) = info.buffer() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(pts) = buffer.pts() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let map = buffer.map_readable().unwrap();
+                if let Some(sample) = map
+                    .as_slice()
+                    .chunks_exact(4)
+                    .position(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()).abs() > 0.05)
+                {
+                    let mut points = audio_points.lock().unwrap();
+                    points.audio.get_or_insert(
+                        pts + gst::ClockTime::from_nseconds(sample as u64 * 1_000_000_000 / 48_000),
+                    );
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        loop {
+            let message = bus.timed_pop(gst::ClockTime::from_seconds(30)).unwrap();
+            match message.view() {
+                gst::MessageView::Eos(_) => break,
+                gst::MessageView::Error(error) => panic!(
+                    "synthetic decode failed: {} ({})",
+                    error.error(),
+                    error.debug().unwrap_or_default()
+                ),
+                _ => {}
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+        drop(pipeline);
+        Arc::into_inner(points).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    #[ignore = "encodes and decodes a synthetic 1080p FLV"]
+    fn synthetic_handoff_stays_within_50ms() {
+        gst::init().unwrap();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!("owncast-sync-{suffix}.flv"));
+        write_synthetic_flv(&output);
+        let points = decode_sync_points(&output);
+        let video_pts = points.video.expect("changed video frame");
+        let audio_pts = points.audio.expect("audio beep");
+        let subtitle_pts = points.subtitle.expect("subtitle overlay");
+
+        assert!(video_pts.nseconds().abs_diff(audio_pts.nseconds()) <= 50_000_000);
+        assert!(video_pts.nseconds().abs_diff(subtitle_pts.nseconds()) <= 50_000_000);
+        fs::remove_file(output).unwrap();
+    }
 }
