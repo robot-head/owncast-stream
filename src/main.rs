@@ -1,6 +1,7 @@
 use ffprobe::Stream;
 use serde::Serialize;
 mod media;
+mod pipeline;
 use std::{
     env,
     error::Error,
