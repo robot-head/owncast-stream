@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      created: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release
+        uses: release-plz/action@v0.3
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: echo "tag=$(jq -r '.[0].tag' <<<"$RELEASES")" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.3
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: owncast-stream-linux-amd64.tar.gz
+          - runner: ubuntu-24.04-arm
+            asset: owncast-stream-linux-arm64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Package binary
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: tar -C target/release -czf "$ASSET" owncast-stream
+      - name: Upload binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          ASSET: ${{ matrix.asset }}
+        run: gh release upload "$RELEASE_TAG" "$ASSET" --clobber

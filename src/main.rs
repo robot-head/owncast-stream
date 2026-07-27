@@ -1,6 +1,7 @@
 use serde::Serialize;
 mod media;
 mod pipeline;
+mod ui;
 use std::{
     env,
     error::Error,
@@ -36,14 +37,13 @@ fn resolve_media_path(cwd: &Path, value: &str, name: &str) -> Result<PathBuf, Bo
     if !path.is_file() {
         return Err(error(format!("Cannot read {name}: {value}")));
     }
-    path.canonicalize()
-        .map_err(|_| error(format!("Cannot read {name}: {value}")))
+    Ok(path)
 }
 
 struct Config {
     video: PathBuf,
     subtitles: Option<PathBuf>,
-    title: String,
+    title: Option<String>,
     stream_key: String,
     title_token: String,
 }
@@ -63,13 +63,11 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|value| resolve_media_path(&cwd, value, "subtitles"))
             .transpose()?;
-        let title = values.get(2).cloned().unwrap_or_else(|| {
-            video
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
+        let title = values
+            .get(2)
+            .map(|title| title.trim())
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
 
         Ok(Self {
             video,
@@ -107,7 +105,11 @@ fn main() {
         eprintln!("Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]");
         std::process::exit(2);
     }
-    let result = Config::parse(args.into_iter()).and_then(|config| pipeline::run(&config));
+    let result = Config::parse(args.into_iter()).and_then(|config| {
+        let media = media::discover(&config.video, config.title.as_deref())?;
+        let mut session = pipeline::StreamSession::new(&config, &media)?;
+        ratatui::run(|terminal| ui::run(terminal, &mut session))
+    });
     if let Err(failure) = result {
         eprintln!("{failure}");
         std::process::exit(1);
@@ -117,7 +119,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn resolves_relative_media_path_from_startup_directory() {
@@ -126,5 +131,25 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, root.join("Cargo.toml").canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_symlink_name_in_resolved_media_path() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("owncast-path-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("8f31.mkv"), []).unwrap();
+        symlink("8f31.mkv", root.join("premiere.mkv")).unwrap();
+
+        let resolved = resolve_media_path(&root, "premiere.mkv", "video").unwrap();
+
+        assert_eq!(resolved, root.join("premiere.mkv"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
