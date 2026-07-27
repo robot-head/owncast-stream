@@ -3,6 +3,8 @@
 A small Rust/GStreamer streamer for Owncast. It keeps one RTMP connection open
 while switching from a generated lobby to one movie.
 
+![TUI Demo](./docs/demo.gif)
+
 ## Features
 
 - 1920x1080 H.264 video at 30 fps
