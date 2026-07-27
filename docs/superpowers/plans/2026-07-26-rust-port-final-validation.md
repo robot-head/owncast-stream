@@ -414,3 +414,30 @@ git rev-parse HEAD
 ```
 
 Require the remote branch hash to equal local `HEAD`.
+
+## Final Resolution
+
+The retained-validation cycles correctly exposed a production selection bug
+after the initial validator repair. The production pipeline preferred an
+embedded English subtitle stream over an explicitly supplied SRT, so earlier
+external-SRT timing changes never affected the stream. Explicit subtitles now
+take precedence, with embedded English retained only as fallback.
+
+The external subtitle branch also had to be attached after
+`uridecodebin3` accepted the selected movie streams and pending pads were
+resolved. Attaching it earlier could stall the non-debug root handoff. The
+final sequence is therefore:
+
+1. select video, English audio, and any selected embedded subtitle;
+2. send `SelectStreams`;
+3. resolve already-pending selected pads;
+4. attach the explicit external subtitle branch, or silence subtitles.
+
+No subtitle offset is applied. The supplied SRT is copied unchanged into a
+create-new mode-0600 temporary file and retained for the stream lifetime.
+
+The final immutable live capture is
+`/var/tmp/owncast-task5-attempt43-20260726T235144Z`. The conclusive evaluator
+result is `/var/tmp/Attempt44c-evaluator-20260727T0002Z`: A/V boundary delta
+0 ns, English audio pass, subtitle content pass, and subtitle onset 13 ms from
+the raw SRT cue. The requested decoder tests remained omitted.

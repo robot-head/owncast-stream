@@ -93,3 +93,24 @@ After a conclusive retained pass:
 
 Production installation is required only if the validated production binary
 changes.
+
+## Validated Production Outcome
+
+Retained evaluation showed that the production pipeline was ignoring the
+explicit SRT whenever the movie also contained an embedded English subtitle
+stream. The validated behavior is now:
+
+- an explicitly supplied subtitle file overrides every embedded subtitle;
+- embedded English remains the fallback when no file is supplied;
+- the external SRT is copied byte-for-byte to a private create-new temporary
+  file and retained until streaming ends;
+- movie stream selection and pending-pad resolution happen before the
+  external subtitle branch is attached;
+- no manual subtitle timestamp adjustment is performed.
+
+The final retained capture proves a simultaneous movie video/audio boundary,
+English rather than Italian audio, burned English subtitle content, and
+subtitle onset within 13 ms of the raw SRT timestamp. The evaluator's original
+post-cue control was also corrected to sample within the actual gap between
+adjacent cues rather than inside the next cue; this changed no production
+code or acceptance threshold.
