@@ -1,6 +1,7 @@
 use serde::Serialize;
 mod media;
 mod pipeline;
+mod ui;
 use std::{
     env,
     error::Error,
