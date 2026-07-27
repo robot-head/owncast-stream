@@ -1,7 +1,12 @@
 use serde::Serialize;
 mod media;
 mod pipeline;
-use std::{env, error::Error, fs, path::PathBuf};
+use std::{
+    env,
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+};
 
 const STREAM_KEY_FILE: &str = "/opt/owncast/stream-key";
 const TITLE_TOKEN_FILE: &str = "/opt/owncast/title-token";
@@ -21,6 +26,20 @@ fn error(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(MessageError(message.into()))
 }
 
+fn resolve_media_path(cwd: &Path, value: &str, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let supplied = PathBuf::from(value);
+    let path = if supplied.is_absolute() {
+        supplied
+    } else {
+        cwd.join(supplied)
+    };
+    if !path.is_file() {
+        return Err(error(format!("Cannot read {name}: {value}")));
+    }
+    path.canonicalize()
+        .map_err(|_| error(format!("Cannot read {name}: {value}")))
+}
+
 struct Config {
     video: PathBuf,
     subtitles: Option<PathBuf>,
@@ -37,19 +56,13 @@ impl Config {
             return Err(error("Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]"));
         }
 
-        let video = PathBuf::from(&values[0]);
-        if !video.is_file() {
-            return Err(error(format!("Cannot read video: {}", video.display())));
-        }
+        let cwd = env::current_dir()?;
+        let video = resolve_media_path(&cwd, &values[0], "video")?;
         let subtitles = values
             .get(1)
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        if let Some(path) = &subtitles
-            && !path.is_file()
-        {
-            return Err(error(format!("Cannot read subtitles: {}", path.display())));
-        }
+            .map(|value| resolve_media_path(&cwd, value, "subtitles"))
+            .transpose()?;
         let title = values.get(2).cloned().unwrap_or_else(|| {
             video
                 .file_stem()
@@ -98,5 +111,20 @@ fn main() {
     if let Err(failure) = result {
         eprintln!("{failure}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn resolves_relative_media_path_from_startup_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resolved = resolve_media_path(root, "Cargo.toml", "video").unwrap();
+
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, root.join("Cargo.toml").canonicalize().unwrap());
     }
 }
