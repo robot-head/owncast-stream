@@ -87,59 +87,6 @@ fn read_secret(path: &str, name: &str) -> Result<String, Box<dyn Error>> {
     Ok(value.trim().to_owned())
 }
 
-struct Media {
-    audio_channels: u32,
-    embedded_subtitle: Option<usize>,
-}
-
-impl Media {
-    fn probe(video: &PathBuf) -> Result<Self, Box<dyn Error>> {
-        let probe = ffprobe::ffprobe(video)?;
-        let audio_channels = probe
-            .streams
-            .iter()
-            .find(|stream| stream.codec_type.as_deref() == Some("audio"))
-            .and_then(|stream| stream.channels)
-            .filter(|channels| *channels > 0)
-            .ok_or_else(|| {
-                error(format!(
-                    "Cannot determine audio channels: {}",
-                    video.display()
-                ))
-            })? as u32;
-        let subtitles: Vec<_> = probe
-            .streams
-            .into_iter()
-            .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
-            .collect();
-        Ok(Self {
-            audio_channels,
-            embedded_subtitle: select_subtitle(&subtitles),
-        })
-    }
-}
-
-fn is_text_subtitle(stream: &Stream) -> bool {
-    !matches!(
-        stream.codec_name.as_deref(),
-        Some("dvd_subtitle" | "dvb_subtitle" | "xsub" | "hdmv_pgs_subtitle")
-    )
-}
-
-fn select_subtitle(streams: &[Stream]) -> Option<usize> {
-    streams
-        .iter()
-        .position(|stream| {
-            is_text_subtitle(stream)
-                && stream
-                    .tags
-                    .as_ref()
-                    .and_then(|tags| tags.language.as_deref())
-                    == Some("eng")
-        })
-        .or_else(|| streams.iter().position(is_text_subtitle))
-}
-
 #[derive(Serialize)]
 struct TitleBody<'a> {
     value: &'a str,
@@ -169,50 +116,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;  
-    use ffprobe::{Stream, StreamTags};    
+    use super::*;
     use std::path::Path;
-
-    fn subtitle(codec: &str, language: &str) -> Stream {
-        Stream {
-            codec_name: Some(codec.into()),
-            codec_type: Some("subtitle".into()),
-            tags: Some(StreamTags {
-                language: Some(language.into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn prefers_english_embedded_subtitles() {
-        assert_eq!(
-            super::select_subtitle(&[subtitle("subrip", "spa"), subtitle("subrip", "eng")]),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn falls_back_to_first_embedded_subtitle() {
-        assert_eq!(
-            super::select_subtitle(&[subtitle("subrip", "spa")]),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn ignores_bitmap_embedded_subtitles() {
-        assert_eq!(
-            super::select_subtitle(&[subtitle("hdmv_pgs_subtitle", "eng")]),
-            None
-        );
-    }
-
-    #[test]
-    fn reports_no_embedded_subtitles() {
-        assert_eq!(super::select_subtitle(&[]), None);
-    }
 
     #[test]
     fn resolves_relative_media_path_from_startup_directory() {
