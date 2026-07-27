@@ -54,7 +54,12 @@ pub(crate) fn select_streams(
                 .iter()
                 .find(|stream| stream.kind == StreamKind::Audio && stream.is_default)
         })
-        .ok_or_else(|| "Movie has no English or default audio stream".to_owned())?;
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|stream| stream.kind == StreamKind::Audio)
+        })
+        .ok_or_else(|| "Movie has no audio stream".to_owned())?;
     let subtitle = external
         .map(|path| SubtitleSource::External(path.to_owned()))
         .or_else(|| {
@@ -118,6 +123,15 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_first_audio_when_metadata_has_no_preference() {
+        let streams = vec![
+            stream("video", StreamKind::Video, None, true),
+            stream("audio", StreamKind::Audio, None, false),
+        ];
+        assert_eq!(select_streams(&streams, None).unwrap().audio_id, "audio");
+    }
+
+    #[test]
     fn explicit_subtitles_override_embedded_english() {
         let mut streams = base();
         let mut sdh = stream("eng-sdh", StreamKind::Subtitle, Some("eng"), true);
@@ -165,7 +179,7 @@ mod tests {
         let video_only = vec![stream("video", StreamKind::Video, None, true)];
         assert_eq!(
             select_streams(&video_only, None).unwrap_err(),
-            "Movie has no English or default audio stream"
+            "Movie has no audio stream"
         );
     }
 }
