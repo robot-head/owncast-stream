@@ -668,6 +668,20 @@ pub(crate) struct StreamSession {
     duration: gst::ClockTime,
 }
 
+fn seek_target(
+    position: gst::ClockTime,
+    duration: gst::ClockTime,
+    delta_seconds: i64,
+) -> gst::ClockTime {
+    if delta_seconds >= 0 {
+        position
+            .saturating_add(gst::ClockTime::from_seconds(delta_seconds as u64))
+            .min(duration)
+    } else {
+        position.saturating_sub(gst::ClockTime::from_seconds(delta_seconds.unsigned_abs()))
+    }
+}
+
 impl StreamSession {
     pub(crate) fn new(config: &Config, media: &MediaInfo) -> Result<Self, Box<dyn Error>> {
         let output_url = env::var("OWNCAST_OUTPUT_URL")
@@ -700,6 +714,82 @@ impl StreamSession {
         self.playback.pipeline.set_state(gst::State::Playing)?;
         set_title(&self.title_token, &self.title)?;
         self.state = PlaybackState::Playing;
+        Ok(())
+    }
+
+    pub(crate) fn state(&self) -> PlaybackState {
+        self.state
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn duration(&self) -> gst::ClockTime {
+        self.duration
+    }
+
+    pub(crate) fn position(&self) -> gst::ClockTime {
+        self.playback
+            .pipeline
+            .query_position()
+            .unwrap_or(gst::ClockTime::ZERO)
+    }
+
+    pub(crate) fn toggle_pause(&mut self) -> Result<(), Box<dyn Error>> {
+        match self.state {
+            PlaybackState::Playing => {
+                self.broadcast.freeze()?;
+                self.playback.pipeline.set_state(gst::State::Paused)?;
+                self.state = PlaybackState::Paused;
+            }
+            PlaybackState::Paused => {
+                self.playback.pipeline.set_state(gst::State::Playing)?;
+                self.broadcast.select_movie();
+                self.state = PlaybackState::Playing;
+            }
+            PlaybackState::Lobby => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn seek_by(&mut self, seconds: i64) -> Result<(), Box<dyn Error>> {
+        if self.state == PlaybackState::Lobby {
+            return Ok(());
+        }
+        let target = seek_target(self.position(), self.duration, seconds);
+        let previous_frame = self
+            .broadcast
+            .latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|frame| frame.pts());
+        self.playback
+            .pipeline
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target)?;
+        if self.state == PlaybackState::Paused {
+            self.playback
+                .pipeline
+                .state(gst::ClockTime::from_seconds(5))
+                .0?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                let current_frame = self
+                    .broadcast
+                    .latest_frame
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|frame| frame.pts());
+                if current_frame != previous_frame {
+                    self.broadcast.freeze()?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return Err(error("Sought movie frame did not become available"));
+        }
         Ok(())
     }
 
@@ -923,5 +1013,245 @@ mod tests {
 
         assert!(frames.load(Ordering::Relaxed) >= 3);
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn seek_target_clamps_to_media_bounds() {
+        let position = gst::ClockTime::from_seconds(40);
+        let duration = gst::ClockTime::from_seconds(100);
+
+        assert_eq!(
+            seek_target(position, duration, -30),
+            gst::ClockTime::from_seconds(10)
+        );
+        assert_eq!(seek_target(position, duration, -90), gst::ClockTime::ZERO);
+        assert_eq!(
+            seek_target(position, duration, 30),
+            gst::ClockTime::from_seconds(70)
+        );
+        assert_eq!(seek_target(position, duration, 90), duration);
+    }
+
+    #[test]
+    fn session_pause_and_resume_switch_broadcast_sources() {
+        let _gst = gst_test();
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        let producer = gst::parse::launch(&format!(
+            r#"
+            videotestsrc is-live=true pattern=white
+              ! videoconvert
+              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
+              ! intervideosink channel={INTER_CHANNEL} sync=true
+            audiotestsrc is-live=true wave=sine
+              ! interaudiosink channel={INTER_CHANNEL} sync=true
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let playback_pipeline = gst::Pipeline::new();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        playback_pipeline
+            .add_many([&movie, &subtitle_overlay])
+            .unwrap();
+        let playback = PlaybackPipeline {
+            pipeline: playback_pipeline,
+            movie,
+            subtitle_overlay,
+            sinks: SelectedSinks {
+                video: gst::Pad::new(gst::PadDirection::Sink),
+                audio: gst::Pad::new(gst::PadDirection::Sink),
+                subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            },
+            selection: Arc::new(OnceLock::new()),
+            setup: Arc::new(Mutex::new(SetupState::default())),
+        };
+        let mut session = StreamSession {
+            broadcast,
+            playback,
+            state: PlaybackState::Playing,
+            title: "Passenger".into(),
+            title_token: String::new(),
+            subtitles: None,
+            duration: gst::ClockTime::from_seconds(100),
+        };
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        producer.set_state(gst::State::Playing).unwrap();
+        session.broadcast.select_movie();
+        std::thread::sleep(Duration::from_millis(300));
+
+        session.toggle_pause().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(session.state(), PlaybackState::Paused);
+        assert_eq!(
+            session
+                .broadcast
+                .video_selector
+                .property::<gst::Pad>("active-pad"),
+            session.broadcast.video_freeze_pad
+        );
+        assert_eq!(
+            session
+                .broadcast
+                .audio_selector
+                .property::<gst::Pad>("active-pad"),
+            session.broadcast.audio_lobby_pad
+        );
+
+        session.toggle_pause().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(session.state(), PlaybackState::Playing);
+        assert_eq!(
+            session
+                .broadcast
+                .video_selector
+                .property::<gst::Pad>("active-pad"),
+            session.broadcast.video_movie_pad
+        );
+        assert_eq!(
+            session
+                .broadcast
+                .audio_selector
+                .property::<gst::Pad>("active-pad"),
+            session.broadcast.audio_movie_pad
+        );
+        producer.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn session_seek_uses_clamped_time_and_preserves_state() {
+        let _gst = gst_test();
+        let playback_pipeline = gst::parse::launch(
+            "videotestsrc num-buffers=900 ! video/x-raw,framerate=30/1 ! fakesink sync=true",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        let playback = PlaybackPipeline {
+            pipeline: playback_pipeline,
+            movie,
+            subtitle_overlay,
+            sinks: SelectedSinks {
+                video: gst::Pad::new(gst::PadDirection::Sink),
+                audio: gst::Pad::new(gst::PadDirection::Sink),
+                subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            },
+            selection: Arc::new(OnceLock::new()),
+            setup: Arc::new(Mutex::new(SetupState::default())),
+        };
+        let mut session = StreamSession {
+            broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
+            playback,
+            state: PlaybackState::Playing,
+            title: "Passenger".into(),
+            title_token: String::new(),
+            subtitles: None,
+            duration: gst::ClockTime::from_seconds(30),
+        };
+        session
+            .playback
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session
+            .playback
+            .pipeline
+            .state(gst::ClockTime::from_seconds(1))
+            .0
+            .unwrap();
+
+        session.seek_by(3).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let position = session.position();
+        assert!(
+            position >= gst::ClockTime::from_mseconds(2_900),
+            "position was {position}"
+        );
+        assert!(position <= gst::ClockTime::from_mseconds(3_500));
+        assert_eq!(session.state(), PlaybackState::Playing);
+    }
+
+    #[test]
+    fn paused_seek_refreshes_the_frozen_frame() {
+        let _gst = gst_test();
+        let playback_pipeline = gst::parse::launch(&format!(
+            r#"
+            videotestsrc num-buffers=900
+              ! videoconvert
+              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
+              ! intervideosink channel={INTER_CHANNEL} sync=true
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        let playback = PlaybackPipeline {
+            pipeline: playback_pipeline,
+            movie,
+            subtitle_overlay,
+            sinks: SelectedSinks {
+                video: gst::Pad::new(gst::PadDirection::Sink),
+                audio: gst::Pad::new(gst::PadDirection::Sink),
+                subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            },
+            selection: Arc::new(OnceLock::new()),
+            setup: Arc::new(Mutex::new(SetupState::default())),
+        };
+        let mut session = StreamSession {
+            broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
+            playback,
+            state: PlaybackState::Playing,
+            title: "Passenger".into(),
+            title_token: String::new(),
+            subtitles: None,
+            duration: gst::ClockTime::from_seconds(30),
+        };
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session
+            .playback
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session.broadcast.select_movie();
+        std::thread::sleep(Duration::from_millis(300));
+        session.toggle_pause().unwrap();
+        let before = session
+            .broadcast
+            .latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|frame| frame.pts())
+            .unwrap();
+
+        session.seek_by(3).unwrap();
+
+        let after = session
+            .broadcast
+            .latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|frame| frame.pts())
+            .unwrap();
+        assert!(after > before);
+        assert!(session.position() >= gst::ClockTime::from_mseconds(2_900));
+        assert_eq!(session.state(), PlaybackState::Paused);
     }
 }
