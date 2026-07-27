@@ -182,6 +182,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "audioresample",
     "audiocheblimit",
     "audiodynamic",
+    "volume",
     "x264enc",
     "h264parse",
     "avenc_aac",
@@ -273,6 +274,7 @@ impl PipelineParts {
               ! audiocheblimit mode=high-pass cutoff=80 poles=4
               ! audiodynamic mode=compressor characteristics=soft-knee
                   threshold=0.125 ratio=2.0
+              ! volume name=audio_gain volume=1.4125375
               ! avenc_aac name=audio_encoder bitrate=192000
               ! aacparse name=audio_parser
               ! queue name=audio_output_queue
@@ -2013,6 +2015,11 @@ mod tests {
         };
 
         let parts = PipelineParts::build_with_sink(&config, "fakesink").unwrap();
+        let gain = parts
+            .pipeline
+            .by_name("audio_gain")
+            .expect("Audio gain element is missing");
+        assert!((gain.property::<f64>("volume") - 1.4125375).abs() < 0.000001);
         parts.pipeline.remove(&parts.movie).unwrap();
         let movie_video =
             gst::parse::bin_from_description("videotestsrc is-live=true pattern=white", true)
