@@ -5,5 +5,8 @@ edition = "2024"
 
 [dependencies]
 gstreamer = "0.25"
+gstreamer-pbutils = "0.25"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
+torrent-name-parser = "0.12.1"
 ureq = { version = "3.3", default-features = false, features = ["json"] }
