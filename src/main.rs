@@ -42,7 +42,7 @@ fn resolve_media_path(cwd: &Path, value: &str, name: &str) -> Result<PathBuf, Bo
 struct Config {
     video: PathBuf,
     subtitles: Option<PathBuf>,
-    title: String,
+    title: Option<String>,
     stream_key: String,
     title_token: String,
 }
@@ -62,13 +62,11 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|value| resolve_media_path(&cwd, value, "subtitles"))
             .transpose()?;
-        let title = values.get(2).cloned().unwrap_or_else(|| {
-            video
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
+        let title = values
+            .get(2)
+            .map(|title| title.trim())
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
 
         Ok(Self {
             video,
@@ -106,7 +104,10 @@ fn main() {
         eprintln!("Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]");
         std::process::exit(2);
     }
-    let result = Config::parse(args.into_iter()).and_then(|config| pipeline::run(&config));
+    let result = Config::parse(args.into_iter()).and_then(|config| {
+        let media = media::discover(&config.video, config.title.as_deref())?;
+        pipeline::run(&config, &media)
+    });
     if let Err(failure) = result {
         eprintln!("{failure}");
         std::process::exit(1);

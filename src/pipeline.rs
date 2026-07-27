@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     Config, error,
-    media::{Selection, StreamCandidate, StreamKind, SubtitleSource, select_streams},
+    media::{MediaInfo, Selection, StreamCandidate, StreamKind, SubtitleSource, select_streams},
     set_title,
 };
 
@@ -905,7 +905,7 @@ fn handle_stream_collection_message(
     true
 }
 
-pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(config: &Config, media: &MediaInfo) -> Result<(), Box<dyn Error>> {
     let output_url = env::var("OWNCAST_OUTPUT_URL")
         .unwrap_or_else(|_| format!("rtmp://127.0.0.1/live/{}", config.stream_key));
     let parts = PipelineParts::build(config, &output_url)?;
@@ -944,13 +944,10 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
 
     set_title(
         &config.title_token,
-        &format!("Starting soon: {}", config.title),
+        &format!("Starting soon: {}", media.title),
     )?;
     parts.pipeline.set_state(gst::State::Playing)?;
-    println!(
-        "Lobby is live. Press Enter to start \"{}\"...",
-        config.title
-    );
+    println!("Lobby is live. Press Enter to start \"{}\"...", media.title);
 
     let input_ready = ready.clone();
     thread::spawn(move || {
@@ -967,7 +964,7 @@ pub(crate) fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     let movie_video_pad = parts.movie_video_pad.clone();
     let movie_audio_pad = parts.movie_audio_pad.clone();
     let switch_bus = bus.clone();
-    let title = config.title.clone();
+    let title = media.title.clone();
     let title_token = config.title_token.clone();
     let switch_flag = switched.clone();
     thread::spawn(move || {
@@ -1526,7 +1523,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };
@@ -1569,7 +1566,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: Some(subtitle.clone()),
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };
@@ -1625,7 +1622,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };
@@ -1841,7 +1838,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };
@@ -2031,7 +2028,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/movie.mkv"),
             subtitles: None,
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };
@@ -2123,7 +2120,7 @@ mod tests {
         let config = Config {
             video: PathBuf::from("/tmp/synthetic-movie.mkv"),
             subtitles: None,
-            title: String::new(),
+            title: None,
             stream_key: String::new(),
             title_token: String::new(),
         };

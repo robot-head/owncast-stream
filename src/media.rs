@@ -1,4 +1,12 @@
-use std::path::{Path, PathBuf};
+use gstreamer as gst;
+use gstreamer_pbutils::{Discoverer, DiscovererResult, prelude::DiscovererStreamInfoExt};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+};
+use torrent_name_parser::Metadata;
+
+use crate::error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StreamKind {
@@ -28,6 +36,73 @@ pub(crate) struct Selection {
     pub video_id: String,
     pub audio_id: String,
     pub subtitle: SubtitleSource,
+}
+
+pub(crate) struct MediaInfo {
+    pub(crate) title: String,
+    pub(crate) duration: gst::ClockTime,
+}
+
+pub(crate) fn resolve_title(explicit: Option<&str>, embedded: Option<&str>, path: &Path) -> String {
+    if let Some(title) = explicit
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .or_else(|| embedded.map(str::trim).filter(|title| !title.is_empty()))
+    {
+        return title.to_owned();
+    }
+    if let Some(title) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Metadata::from(name).ok())
+        .map(|metadata| metadata.title().trim().to_owned())
+        .filter(|title| !title.is_empty())
+    {
+        return title;
+    }
+    path.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn validated_duration(
+    result: DiscovererResult,
+    seekable: bool,
+    duration: Option<gst::ClockTime>,
+) -> Result<gst::ClockTime, String> {
+    if result != DiscovererResult::Ok {
+        return Err(format!("Media discovery failed: {result:?}"));
+    }
+    if !seekable {
+        return Err("Media is not seekable".into());
+    }
+    duration
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "Media duration is unavailable".into())
+}
+
+pub(crate) fn discover(
+    path: &Path,
+    explicit_title: Option<&str>,
+) -> Result<MediaInfo, Box<dyn Error>> {
+    gst::init()?;
+    let uri = gst::glib::filename_to_uri(path, None)?;
+    let info = Discoverer::new(gst::ClockTime::from_seconds(10))?.discover_uri(&uri)?;
+    let duration =
+        validated_duration(info.result(), info.is_seekable(), info.duration()).map_err(error)?;
+    let embedded = info
+        .stream_info()
+        .and_then(|stream| stream.tags())
+        .and_then(|tags| {
+            tags.get::<gst::tags::Title>()
+                .map(|title| title.get().to_owned())
+        });
+
+    Ok(MediaInfo {
+        title: resolve_title(explicit_title, embedded.as_deref(), path),
+        duration,
+    })
 }
 
 pub(crate) fn select_streams(
@@ -181,5 +256,45 @@ mod tests {
             select_streams(&video_only, None).unwrap_err(),
             "Movie has no audio stream"
         );
+    }
+
+    #[test]
+    fn title_precedence_prefers_explicit_then_embedded() {
+        let path = Path::new("Passenger.2024.1080p.BluRay.mkv");
+
+        assert_eq!(
+            resolve_title(Some(" Director's Cut "), Some("Embedded"), path),
+            "Director's Cut"
+        );
+        assert_eq!(
+            resolve_title(Some(""), Some(" Embedded "), path),
+            "Embedded"
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_parsed_filename_then_raw_stem() {
+        assert_eq!(
+            resolve_title(None, None, Path::new("Passenger.2024.1080p.BluRay.mkv")),
+            "Passenger"
+        );
+        assert_eq!(resolve_title(None, None, Path::new("1080p.mkv")), "1080p");
+    }
+
+    #[test]
+    fn discovery_requires_ok_seekable_nonzero_duration() {
+        use gstreamer_pbutils::DiscovererResult;
+
+        let minute = gst::ClockTime::from_seconds(60);
+        assert_eq!(
+            validated_duration(DiscovererResult::Ok, true, Some(minute)).unwrap(),
+            minute
+        );
+        assert!(validated_duration(DiscovererResult::Error, true, Some(minute)).is_err());
+        assert!(validated_duration(DiscovererResult::Ok, false, Some(minute)).is_err());
+        assert!(
+            validated_duration(DiscovererResult::Ok, true, Some(gst::ClockTime::ZERO)).is_err()
+        );
+        assert!(validated_duration(DiscovererResult::Ok, true, None).is_err());
     }
 }
