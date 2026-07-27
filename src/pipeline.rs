@@ -612,6 +612,15 @@ impl PlaybackPipeline {
             .ok_or_else(|| error("No movie frame is available to freeze"))
     }
 
+    fn check_bus_errors(bus: &gst::Bus) -> Result<(), Box<dyn Error>> {
+        while let Some(message) = bus.timed_pop(gst::ClockTime::ZERO) {
+            if let Some(failure) = bus_error(&message) {
+                return Err(error(failure));
+            }
+        }
+        Ok(())
+    }
+
     fn wait_for_frame_after(
         &self,
         generation: u64,
@@ -626,11 +635,7 @@ impl PlaybackPipeline {
             while gst::glib::MainContext::default().pending() {
                 gst::glib::MainContext::default().iteration(false);
             }
-            while let Some(message) = bus.timed_pop(gst::ClockTime::ZERO) {
-                if let Some(failure) = bus_error(&message) {
-                    return Err(error(failure));
-                }
-            }
+            Self::check_bus_errors(&bus)?;
             if let Some(frame) = self
                 .latest_frame
                 .lock()
@@ -916,10 +921,21 @@ impl StreamSession {
             .pipeline
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target)?;
         if self.state == PlaybackState::Paused {
-            self.playback
+            let state_change = self
+                .playback
                 .pipeline
                 .state(gst::ClockTime::from_seconds(5))
-                .0?;
+                .0;
+            PlaybackPipeline::check_bus_errors(
+                &self
+                    .playback
+                    .pipeline
+                    .bus()
+                    .ok_or_else(|| error("Playback bus is missing"))?,
+            )?;
+            if state_change? == gst::StateChangeSuccess::Async {
+                return Err(error("Playback pipeline did not settle within 5 seconds"));
+            }
             if keep_last_frame {
                 return Ok(());
             }
@@ -1332,6 +1348,69 @@ mod tests {
                 .property::<gst::Pad>("active-pad"),
             selected
         );
+    }
+
+    #[test]
+    fn paused_seek_to_duration_propagates_playback_error() {
+        let _gst = gst_test();
+        let mut session = session_with_test_video(0);
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session.start_transition(Duration::from_secs(1)).unwrap();
+        let freezes = Arc::new(AtomicU64::new(0));
+        let counted_freezes = freezes.clone();
+        session
+            .broadcast
+            .freeze_source
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counted_freezes.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        session.toggle_pause().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while freezes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let freeze_count = freezes.load(Ordering::Relaxed);
+        assert!(freeze_count > 0);
+        let bus = session.playback.pipeline.bus().unwrap();
+        session
+            .playback
+            .pipeline
+            .by_name("movie_video_output")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                if matches!(
+                    info.event().map(|event| event.view()),
+                    Some(gst::EventView::Seek(_))
+                ) {
+                    bus.post(
+                        gst::message::Error::builder(
+                            gst::CoreError::Failed,
+                            "synthetic seek failure",
+                        )
+                        .build(),
+                    )
+                    .unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        let failure = session.seek_by(30).unwrap_err();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(failure.to_string().contains("synthetic seek failure"));
+        assert_eq!(freezes.load(Ordering::Relaxed), freeze_count);
+        assert_eq!(session.state(), PlaybackState::Paused);
     }
 
     #[test]
