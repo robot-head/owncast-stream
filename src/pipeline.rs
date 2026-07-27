@@ -183,7 +183,6 @@ struct BroadcastPipeline {
     audio_gain: gst::Element,
     freeze_bin: gst::Bin,
     freeze_source: gst::Element,
-    latest_frame: Arc<Mutex<Option<gst::Buffer>>>,
     audio_lobby_pad: gst::Pad,
     video_movie_pad: gst::Pad,
     audio_movie_pad: gst::Pad,
@@ -304,16 +303,6 @@ impl BroadcastPipeline {
             .static_pad("src")
             .ok_or_else(|| error("Freeze output is missing"))?
             .link(&video_freeze_pad)?;
-        let latest_frame = Arc::new(Mutex::new(None));
-        let captured_frame = latest_frame.clone();
-        video_movie_pad
-            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-                if let Some(buffer) = info.buffer() {
-                    *captured_frame.lock().unwrap() = Some(buffer.copy());
-                }
-                gst::PadProbeReturn::Ok
-            })
-            .ok_or_else(|| error("Cannot capture movie frames"))?;
         video_selector.set_property("active-pad", Some(&video_lobby_pad));
         audio_selector.set_property("active-pad", Some(&audio_lobby_pad));
 
@@ -324,7 +313,6 @@ impl BroadcastPipeline {
             audio_gain,
             freeze_bin,
             freeze_source,
-            latest_frame,
             audio_lobby_pad,
             video_movie_pad,
             audio_movie_pad,
@@ -339,14 +327,7 @@ impl BroadcastPipeline {
             .set_property("active-pad", Some(&self.audio_movie_pad));
     }
 
-    fn freeze(&self) -> Result<(), Box<dyn Error>> {
-        let mut frame = self
-            .latest_frame
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|buffer| buffer.copy())
-            .ok_or_else(|| error("No movie frame is available to freeze"))?;
+    fn freeze(&self, mut frame: gst::Buffer) -> Result<(), Box<dyn Error>> {
         {
             let frame = frame
                 .get_mut()
@@ -484,6 +465,12 @@ struct PlaybackPipeline {
     sinks: SelectedSinks,
     selection: Arc<OnceLock<Selection>>,
     setup: Arc<Mutex<SetupState>>,
+    latest_frame: Arc<Mutex<Option<CapturedFrame>>>,
+}
+
+struct CapturedFrame {
+    generation: u64,
+    buffer: gst::Buffer,
 }
 
 impl PlaybackPipeline {
@@ -524,6 +511,11 @@ impl PlaybackPipeline {
         let subtitle_overlay = video_bin
             .by_name("movie_subtitles")
             .ok_or_else(|| error("Subtitle overlay is missing"))?;
+        let latest_frame = Self::capture_output(
+            &video_bin
+                .by_name("movie_video_output")
+                .ok_or_else(|| error("Movie video output is missing"))?,
+        )?;
         let video_sink = gst::GhostPad::builder_with_target(
             &video_bin
                 .by_name("movie_video_input")
@@ -575,7 +567,86 @@ impl PlaybackPipeline {
             sinks,
             selection,
             setup,
+            latest_frame,
         })
+    }
+
+    fn capture_output(
+        movie_video_output: &gst::Element,
+    ) -> Result<Arc<Mutex<Option<CapturedFrame>>>, Box<dyn Error>> {
+        let latest_frame = Arc::new(Mutex::new(None::<CapturedFrame>));
+        let captured_frame = latest_frame.clone();
+        movie_video_output
+            .static_pad("sink")
+            .ok_or_else(|| error("Movie video output is missing its sink pad"))?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(buffer) = info.buffer() {
+                    let mut latest = captured_frame.lock().unwrap();
+                    *latest = Some(CapturedFrame {
+                        generation: latest
+                            .as_ref()
+                            .map_or(1, |frame| frame.generation.saturating_add(1)),
+                        buffer: buffer.copy(),
+                    });
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or_else(|| error("Cannot capture movie frames"))?;
+        Ok(latest_frame)
+    }
+
+    fn frame_generation(&self) -> u64 {
+        self.latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |frame| frame.generation)
+    }
+
+    fn latest_frame(&self) -> Result<gst::Buffer, Box<dyn Error>> {
+        self.latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|frame| frame.buffer.copy())
+            .ok_or_else(|| error("No movie frame is available to freeze"))
+    }
+
+    fn wait_for_frame_after(
+        &self,
+        generation: u64,
+        timeout: Duration,
+    ) -> Result<gst::Buffer, Box<dyn Error>> {
+        let bus = self
+            .pipeline
+            .bus()
+            .ok_or_else(|| error("Playback bus is missing"))?;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            while gst::glib::MainContext::default().pending() {
+                gst::glib::MainContext::default().iteration(false);
+            }
+            while let Some(message) = bus.timed_pop(gst::ClockTime::ZERO) {
+                if let Some(failure) = bus_error(&message) {
+                    return Err(error(failure));
+                }
+            }
+            if let Some(frame) = self
+                .latest_frame
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|frame| frame.generation > generation)
+            {
+                return Ok(frame.buffer.copy());
+            }
+            if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(10))
+                && let Some(failure) = bus_error(&message)
+            {
+                return Err(error(failure));
+            }
+        }
+        Err(error("Movie frame did not become available"))
     }
 
     fn add_external_subtitles(&self, path: &std::path::Path) -> Result<(), Box<dyn Error>> {
@@ -770,9 +841,15 @@ impl StreamSession {
             return Ok(());
         }
         self.playback.wait_ready(self.subtitles.as_deref())?;
-        self.broadcast.select_movie();
-        self.playback.pipeline.set_state(gst::State::Playing)?;
+        self.start_transition(Duration::from_secs(1))?;
         set_title(&self.title_token, &self.title)?;
+        Ok(())
+    }
+
+    fn start_transition(&mut self, timeout: Duration) -> Result<(), Box<dyn Error>> {
+        self.playback.pipeline.set_state(gst::State::Playing)?;
+        self.playback.wait_for_frame_after(0, timeout)?;
+        self.broadcast.select_movie();
         self.state = PlaybackState::Playing;
         Ok(())
     }
@@ -814,7 +891,7 @@ impl StreamSession {
     pub(crate) fn toggle_pause(&mut self) -> Result<(), Box<dyn Error>> {
         match self.state {
             PlaybackState::Playing => {
-                self.broadcast.freeze()?;
+                self.broadcast.freeze(self.playback.latest_frame()?)?;
                 self.playback.pipeline.set_state(gst::State::Paused)?;
                 self.state = PlaybackState::Paused;
             }
@@ -833,13 +910,10 @@ impl StreamSession {
             return Ok(());
         }
         let target = seek_target(self.position(), self.duration, seconds);
-        let previous_frame = self
-            .broadcast
-            .latest_frame
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|frame| frame.pts());
+        if self.state == PlaybackState::Paused && target == self.duration {
+            return Ok(());
+        }
+        let generation = self.playback.frame_generation();
         self.playback
             .pipeline
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target)?;
@@ -848,22 +922,10 @@ impl StreamSession {
                 .pipeline
                 .state(gst::ClockTime::from_seconds(5))
                 .0?;
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while Instant::now() < deadline {
-                let current_frame = self
-                    .broadcast
-                    .latest_frame
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|frame| frame.pts());
-                if current_frame != previous_frame {
-                    self.broadcast.freeze()?;
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            return Err(error("Sought movie frame did not become available"));
+            let frame = self
+                .playback
+                .wait_for_frame_after(generation, Duration::from_secs(1))?;
+            self.broadcast.freeze(frame)?;
         }
         Ok(())
     }
@@ -975,6 +1037,7 @@ mod tests {
                 },
                 selection: Arc::new(OnceLock::new()),
                 setup: Arc::new(Mutex::new(SetupState::default())),
+                latest_frame: Arc::new(Mutex::new(None)),
             },
             state: PlaybackState::Lobby,
             gain_db: DEFAULT_GAIN_DB,
@@ -984,6 +1047,247 @@ mod tests {
             subtitles: None,
             duration: gst::ClockTime::from_seconds(100),
         }
+    }
+
+    fn playback_capture_with_appsrc() -> (PlaybackPipeline, gst::Element) {
+        let pipeline = gst::parse::launch(&format!(
+            r#"
+            appsrc name=source is-live=true format=time
+                caps="video/x-raw,format=I420,width=16,height=16,framerate=30/1"
+              ! intervideosink name=movie_video_output channel={INTER_CHANNEL} sync=false
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let source = pipeline.by_name("source").unwrap();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        let latest_frame =
+            PlaybackPipeline::capture_output(&pipeline.by_name("movie_video_output").unwrap())
+                .unwrap();
+        (
+            PlaybackPipeline {
+                pipeline,
+                movie,
+                subtitle_overlay,
+                sinks: SelectedSinks {
+                    video: gst::Pad::new(gst::PadDirection::Sink),
+                    audio: gst::Pad::new(gst::PadDirection::Sink),
+                    subtitle: gst::Pad::new(gst::PadDirection::Sink),
+                },
+                selection: Arc::new(OnceLock::new()),
+                setup: Arc::new(Mutex::new(SetupState::default())),
+                latest_frame,
+            },
+            source,
+        )
+    }
+
+    fn push_test_frame(source: &gst::Element, pts: gst::ClockTime) {
+        let mut frame = gst::Buffer::with_size(16 * 16 * 3 / 2).unwrap();
+        frame.get_mut().unwrap().set_pts(pts);
+        assert_eq!(
+            source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&frame]),
+            gst::FlowReturn::Ok
+        );
+    }
+
+    fn session_with_test_video(delay_microseconds: u64) -> StreamSession {
+        let pipeline = gst::parse::launch(&format!(
+            r#"
+            videotestsrc num-buffers=900 pattern=ball
+              ! identity sleep-time={delay_microseconds}
+              ! videoconvert
+              ! video/x-raw,format=I420,width=16,height=16,framerate=30/1
+              ! identity name=movie_video_output
+              ! fakesink sync=true
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let latest_frame =
+            PlaybackPipeline::capture_output(&pipeline.by_name("movie_video_output").unwrap())
+                .unwrap();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        StreamSession {
+            broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
+            playback: PlaybackPipeline {
+                pipeline,
+                movie,
+                subtitle_overlay,
+                sinks: SelectedSinks {
+                    video: gst::Pad::new(gst::PadDirection::Sink),
+                    audio: gst::Pad::new(gst::PadDirection::Sink),
+                    subtitle: gst::Pad::new(gst::PadDirection::Sink),
+                },
+                selection: Arc::new(OnceLock::new()),
+                setup: Arc::new(Mutex::new(SetupState::default())),
+                latest_frame,
+            },
+            state: PlaybackState::Lobby,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
+            title: "Passenger".into(),
+            title_token: String::new(),
+            subtitles: None,
+            duration: gst::ClockTime::from_seconds(30),
+        }
+    }
+
+    #[test]
+    fn playback_capture_advances_only_for_source_frames() {
+        let _gst = gst_test();
+        let (playback, source) = playback_capture_with_appsrc();
+        playback.pipeline.set_state(gst::State::Playing).unwrap();
+        push_test_frame(&source, gst::ClockTime::from_seconds(1));
+        playback
+            .wait_for_frame_after(0, Duration::from_secs(1))
+            .unwrap();
+        let generation = playback.frame_generation();
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        broadcast.pipeline.set_state(gst::State::Playing).unwrap();
+        broadcast.select_movie();
+
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(playback.frame_generation(), generation);
+    }
+
+    #[test]
+    fn wait_for_frame_after_returns_the_new_source_buffer() {
+        let _gst = gst_test();
+        let (playback, source) = playback_capture_with_appsrc();
+        playback.pipeline.set_state(gst::State::Playing).unwrap();
+        push_test_frame(&source, gst::ClockTime::from_seconds(1));
+        playback
+            .wait_for_frame_after(0, Duration::from_secs(1))
+            .unwrap();
+        let generation = playback.frame_generation();
+
+        push_test_frame(&source, gst::ClockTime::from_seconds(2));
+        let frame = playback
+            .wait_for_frame_after(generation, Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(playback.frame_generation(), generation + 1);
+        assert_eq!(frame.pts(), Some(gst::ClockTime::from_seconds(2)));
+    }
+
+    #[test]
+    fn wait_for_frame_after_propagates_playback_error_before_a_frame() {
+        let _gst = gst_test();
+        let (playback, source) = playback_capture_with_appsrc();
+        playback.pipeline.set_state(gst::State::Playing).unwrap();
+        playback
+            .pipeline
+            .bus()
+            .unwrap()
+            .post(gst::message::Error::builder(gst::CoreError::Failed, "synthetic failure").build())
+            .unwrap();
+        push_test_frame(&source, gst::ClockTime::from_seconds(1));
+
+        let failure = playback
+            .wait_for_frame_after(0, Duration::from_secs(1))
+            .unwrap_err();
+
+        assert!(failure.to_string().contains("synthetic failure"));
+    }
+
+    #[test]
+    fn start_waits_for_first_movie_frame_before_playing() {
+        let _gst = gst_test();
+        let mut session = session_with_test_video(150_000);
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        let started = Instant::now();
+
+        session.start_transition(Duration::from_secs(1)).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(session.state(), PlaybackState::Playing);
+        session.toggle_pause().unwrap();
+        assert_eq!(session.state(), PlaybackState::Paused);
+    }
+
+    #[test]
+    fn paused_seek_freezes_a_post_seek_source_frame() {
+        let _gst = gst_test();
+        let mut session = session_with_test_video(0);
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session.start_transition(Duration::from_secs(1)).unwrap();
+        session.toggle_pause().unwrap();
+        let generation = session.playback.frame_generation();
+        let frozen = Arc::new(Mutex::new(None));
+        let captured = frozen.clone();
+        session
+            .broadcast
+            .freeze_source
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(buffer) = info.buffer()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    *captured.lock().unwrap() = Some(map.as_slice().to_vec());
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        session.seek_by(3).unwrap();
+
+        assert!(session.playback.frame_generation() > generation);
+        let current = session.playback.latest_frame().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while frozen.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frozen = frozen.lock().unwrap().clone();
+        assert_eq!(
+            frozen.as_deref(),
+            Some(current.map_readable().unwrap().as_slice())
+        );
+        assert_eq!(session.state(), PlaybackState::Paused);
+    }
+
+    #[test]
+    fn paused_seek_to_duration_keeps_last_frame() {
+        let _gst = gst_test();
+        let mut session = session_with_test_video(0);
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session.start_transition(Duration::from_secs(1)).unwrap();
+        session.toggle_pause().unwrap();
+        let generation = session.playback.frame_generation();
+        let selected = session
+            .broadcast
+            .video_selector
+            .property::<gst::Pad>("active-pad");
+
+        session.seek_by(30).unwrap();
+
+        assert_eq!(session.state(), PlaybackState::Paused);
+        assert_eq!(session.playback.frame_generation(), generation);
+        assert_eq!(
+            session
+                .broadcast
+                .video_selector
+                .property::<gst::Pad>("active-pad"),
+            selected
+        );
     }
 
     #[test]
@@ -1225,7 +1529,9 @@ mod tests {
         playback.set_state(gst::State::Playing).unwrap();
         broadcast.select_movie();
         std::thread::sleep(Duration::from_millis(300));
-        broadcast.freeze().unwrap();
+        broadcast
+            .freeze(gst::Buffer::with_size(1920 * 1080 * 3 / 2).unwrap())
+            .unwrap();
         playback.set_state(gst::State::Paused).unwrap();
         let before = frames.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(250));
@@ -1302,57 +1608,13 @@ mod tests {
     #[test]
     fn session_pause_and_resume_switch_broadcast_sources() {
         let _gst = gst_test();
-        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
-        let producer = gst::parse::launch(&format!(
-            r#"
-            videotestsrc is-live=true pattern=white
-              ! videoconvert
-              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
-              ! intervideosink channel={INTER_CHANNEL} sync=true
-            audiotestsrc is-live=true wave=sine
-              ! interaudiosink channel={INTER_CHANNEL} sync=true
-            "#
-        ))
-        .unwrap()
-        .downcast::<gst::Pipeline>()
-        .unwrap();
-        let playback_pipeline = gst::Pipeline::new();
-        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
-        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
-        playback_pipeline
-            .add_many([&movie, &subtitle_overlay])
-            .unwrap();
-        let playback = PlaybackPipeline {
-            pipeline: playback_pipeline,
-            movie,
-            subtitle_overlay,
-            sinks: SelectedSinks {
-                video: gst::Pad::new(gst::PadDirection::Sink),
-                audio: gst::Pad::new(gst::PadDirection::Sink),
-                subtitle: gst::Pad::new(gst::PadDirection::Sink),
-            },
-            selection: Arc::new(OnceLock::new()),
-            setup: Arc::new(Mutex::new(SetupState::default())),
-        };
-        let mut session = StreamSession {
-            broadcast,
-            playback,
-            state: PlaybackState::Playing,
-            gain_db: DEFAULT_GAIN_DB,
-            levels: AudioLevels::default(),
-            title: "Passenger".into(),
-            title_token: String::new(),
-            subtitles: None,
-            duration: gst::ClockTime::from_seconds(100),
-        };
+        let mut session = session_with_test_video(0);
         session
             .broadcast
             .pipeline
             .set_state(gst::State::Playing)
             .unwrap();
-        producer.set_state(gst::State::Playing).unwrap();
-        session.broadcast.select_movie();
-        std::thread::sleep(Duration::from_millis(300));
+        session.start_transition(Duration::from_secs(1)).unwrap();
 
         session.toggle_pause().unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -1391,7 +1653,6 @@ mod tests {
                 .property::<gst::Pad>("active-pad"),
             session.broadcast.audio_movie_pad
         );
-        producer.set_state(gst::State::Null).unwrap();
     }
 
     #[test]
@@ -1416,6 +1677,7 @@ mod tests {
             },
             selection: Arc::new(OnceLock::new()),
             setup: Arc::new(Mutex::new(SetupState::default())),
+            latest_frame: Arc::new(Mutex::new(None)),
         };
         let mut session = StreamSession {
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
@@ -1450,81 +1712,5 @@ mod tests {
         );
         assert!(position <= gst::ClockTime::from_mseconds(3_500));
         assert_eq!(session.state(), PlaybackState::Playing);
-    }
-
-    #[test]
-    fn paused_seek_refreshes_the_frozen_frame() {
-        let _gst = gst_test();
-        let playback_pipeline = gst::parse::launch(&format!(
-            r#"
-            videotestsrc num-buffers=900
-              ! videoconvert
-              ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
-              ! intervideosink channel={INTER_CHANNEL} sync=true
-            "#
-        ))
-        .unwrap()
-        .downcast::<gst::Pipeline>()
-        .unwrap();
-        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
-        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
-        let playback = PlaybackPipeline {
-            pipeline: playback_pipeline,
-            movie,
-            subtitle_overlay,
-            sinks: SelectedSinks {
-                video: gst::Pad::new(gst::PadDirection::Sink),
-                audio: gst::Pad::new(gst::PadDirection::Sink),
-                subtitle: gst::Pad::new(gst::PadDirection::Sink),
-            },
-            selection: Arc::new(OnceLock::new()),
-            setup: Arc::new(Mutex::new(SetupState::default())),
-        };
-        let mut session = StreamSession {
-            broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
-            playback,
-            state: PlaybackState::Playing,
-            gain_db: DEFAULT_GAIN_DB,
-            levels: AudioLevels::default(),
-            title: "Passenger".into(),
-            title_token: String::new(),
-            subtitles: None,
-            duration: gst::ClockTime::from_seconds(30),
-        };
-        session
-            .broadcast
-            .pipeline
-            .set_state(gst::State::Playing)
-            .unwrap();
-        session
-            .playback
-            .pipeline
-            .set_state(gst::State::Playing)
-            .unwrap();
-        session.broadcast.select_movie();
-        std::thread::sleep(Duration::from_millis(300));
-        session.toggle_pause().unwrap();
-        let before = session
-            .broadcast
-            .latest_frame
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|frame| frame.pts())
-            .unwrap();
-
-        session.seek_by(3).unwrap();
-
-        let after = session
-            .broadcast
-            .latest_frame
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|frame| frame.pts())
-            .unwrap();
-        assert!(after > before);
-        assert!(session.position() >= gst::ClockTime::from_mseconds(2_900));
-        assert_eq!(session.state(), PlaybackState::Paused);
     }
 }
