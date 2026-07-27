@@ -434,7 +434,8 @@ mod tests {
         let text = region_text(buffer, Rect::new(0, 0, 110, 28));
         let left_meter = row_text(buffer, 9, 83);
         let right_meter = row_text(buffer, 10, 83);
-        let controls = region_text(buffer, Rect::new(0, 16, 83, 12));
+        let control_panels =
+            Layout::horizontal(vec![Constraint::Ratio(1, 5); 5]).split(Rect::new(0, 16, 83, 12));
         let rail = region_text(buffer, Rect::new(83, 0, 27, 28));
 
         assert!(text.contains("OWNCAST"));
@@ -455,19 +456,21 @@ mod tests {
         assert!(right_meter.contains('┃'));
         assert!(right_meter.contains("-6.1 dB"));
         assert!(right_meter.find('┃') > right_meter.rfind('█'));
-        for required in [
-            "ENTER",
-            "START",
-            "SPACE",
-            "PAUSE / RESUME",
-            "← / →",
-            "JUMP 30 SEC",
-            "↑ / ↓",
-            "GAIN 1 dB",
-            "Q",
-            "EXIT SHOW",
-        ] {
-            assert!(controls.contains(required), "missing control {required}");
+        for ((key, action), area) in [
+            ("ENTER", "START"),
+            ("SPACE", "PAUSE / RESUME"),
+            ("← / →", "JUMP 30 SEC"),
+            ("↑ / ↓", "GAIN 1 dB"),
+            ("Q", "EXIT SHOW"),
+        ]
+        .into_iter()
+        .zip(control_panels.iter())
+        {
+            let control = region_text(buffer, *area);
+            assert!(
+                control.contains(key) && control.contains(action),
+                "control panel does not pair {key} with {action}"
+            );
         }
         for required in [
             "SYSTEM",
@@ -524,11 +527,15 @@ mod tests {
         ] {
             assert!(main.contains(required), "missing main value {required}");
         }
-        for value in ["-4.2 dB", "-6.1 dB"] {
+        for (channel, value) in [("L ", "-4.2 dB"), ("R ", "-6.1 dB")] {
             let (y, meter) = (0..23)
                 .map(|y| (y, row_text(buffer, y, 60)))
                 .find(|(_, row)| row.contains(value))
                 .unwrap();
+            assert!(
+                meter.contains(channel),
+                "meter row {y} does not label {value} as {channel}"
+            );
             assert!(meter.contains('█'), "meter row {y} has no current fill");
             assert!(meter.contains('┃'), "meter row {y} has no held marker");
             assert!(
