@@ -163,7 +163,7 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect, wide: bool) {
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, status: &Status<'_>, wide: bool) {
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if wide { 2 } else { 1 }),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -320,7 +320,17 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::pipeline::AudioLevels;
-    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, crossterm::event::KeyCode};
+
+    fn region_text(buffer: &Buffer, area: Rect) -> String {
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| buffer[(x, y)].symbol()))
+            .collect()
+    }
+
+    fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
+        region_text(buffer, Rect::new(0, y, width, 1))
+    }
 
     fn status() -> Status<'static> {
         Status {
@@ -420,13 +430,12 @@ mod tests {
     fn renders_amber_projection_console() {
         let mut terminal = Terminal::new(TestBackend::new(110, 28)).unwrap();
         terminal.draw(|frame| render(frame, &status())).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let buffer = terminal.backend().buffer();
+        let text = region_text(buffer, Rect::new(0, 0, 110, 28));
+        let left_meter = row_text(buffer, 9, 83);
+        let right_meter = row_text(buffer, 10, 83);
+        let controls = region_text(buffer, Rect::new(0, 16, 83, 12));
+        let rail = region_text(buffer, Rect::new(83, 0, 27, 28));
 
         assert!(text.contains("OWNCAST"));
         assert!(text.contains("SHOW LOCAL - AUTO MODE"));
@@ -436,40 +445,111 @@ mod tests {
         assert!(text.contains("00:42:18 / 01:47:03"));
         assert!(text.contains("GAIN +3 dB"));
         assert!(text.contains("PROGRAM AUDIO / 3 SEC PEAK HOLD"));
-        assert!(text.contains("ENTER"));
-        assert!(text.contains("↑ / ↓"));
-        assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .any(|cell| cell.fg == AMBER)
-        );
+        assert!(left_meter.contains("L "));
+        assert!(left_meter.contains('█'));
+        assert!(left_meter.contains('┃'));
+        assert!(left_meter.contains("-4.2 dB"));
+        assert!(left_meter.find('┃') > left_meter.rfind('█'));
+        assert!(right_meter.contains("R "));
+        assert!(right_meter.contains('█'));
+        assert!(right_meter.contains('┃'));
+        assert!(right_meter.contains("-6.1 dB"));
+        assert!(right_meter.find('┃') > right_meter.rfind('█'));
+        for required in [
+            "ENTER",
+            "START",
+            "SPACE",
+            "PAUSE / RESUME",
+            "← / →",
+            "JUMP 30 SEC",
+            "↑ / ↓",
+            "GAIN 1 dB",
+            "Q",
+            "EXIT SHOW",
+        ] {
+            assert!(controls.contains(required), "missing control {required}");
+        }
+        for required in [
+            "SYSTEM",
+            "STREAM READY",
+            "GAIN VALUE",
+            "+3 dB",
+            "PEAK VALUES",
+            "L  -2.8 dB",
+            "R  -3.4 dB",
+        ] {
+            assert!(rail.contains(required), "missing rail value {required}");
+        }
+        assert_eq!(buffer[(0, 13)].symbol(), "╔");
+        assert_eq!(buffer[(82, 13)].symbol(), "╗");
+        assert_eq!(buffer[(0, 15)].symbol(), "╚");
+        assert_eq!(buffer[(82, 15)].symbol(), "╝");
+        for y in (0..28).filter(|y| ![5, 6].contains(y)) {
+            assert!(
+                (0..110).all(|x| buffer[(x, y)].bg == BLACK),
+                "row {y} did not retain the black console background"
+            );
+        }
+        assert_eq!(buffer[(5, 5)].fg, BLACK);
+        assert_eq!(buffer[(5, 5)].bg, AMBER);
+        assert!(buffer.content().iter().any(|cell| cell.fg == AMBER));
     }
 
     #[test]
     fn narrow_console_keeps_core_status_and_controls() {
         let mut terminal = Terminal::new(TestBackend::new(60, 34)).unwrap();
         terminal.draw(|frame| render(frame, &status())).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let buffer = terminal.backend().buffer();
+        let main = region_text(buffer, Rect::new(0, 0, 60, 23));
+        let rail = region_text(buffer, Rect::new(0, 23, 60, 11));
 
         for required in [
-            "PASSENGER",
-            "PLAYING",
-            "00:42:18",
+            "TITLE: PASSENGER",
+            "STATUS: PLAYING",
+            "00:42:18 / 01:47:03",
             "GAIN +3 dB",
-            "L",
-            "R",
+            "PROGRAM AUDIO / 3 SEC PEAK HOLD",
+            "-4.2 dB",
+            "-6.1 dB",
+            "ENTER",
+            "START",
+            "SPACE",
+            "PAUSE / RESUME",
+            "← / →",
+            "JUMP 30 SEC",
+            "↑ / ↓",
+            "GAIN 1 dB",
             "Q",
+            "EXIT SHOW",
         ] {
-            assert!(text.contains(required), "missing {required}");
+            assert!(main.contains(required), "missing main value {required}");
+        }
+        for value in ["-4.2 dB", "-6.1 dB"] {
+            let (y, meter) = (0..23)
+                .map(|y| (y, row_text(buffer, y, 60)))
+                .find(|(_, row)| row.contains(value))
+                .unwrap();
+            assert!(meter.contains('█'), "meter row {y} has no current fill");
+            assert!(meter.contains('┃'), "meter row {y} has no held marker");
+            assert!(
+                meter.find('┃') > meter.rfind('█'),
+                "meter row {y} held marker is not beyond the current fill"
+            );
+        }
+        for required in [
+            "SYSTEM",
+            "STREAM READY",
+            "PLAYING",
+            "GAIN VALUE",
+            "+3 dB",
+            "PEAK VALUES",
+            "L  -2.8 dB",
+            "R  -3.4 dB",
+        ] {
+            assert!(
+                rail.contains(required),
+                "missing stacked rail value {required}"
+            );
         }
     }
 }
