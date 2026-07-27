@@ -36,8 +36,7 @@ fn resolve_media_path(cwd: &Path, value: &str, name: &str) -> Result<PathBuf, Bo
     if !path.is_file() {
         return Err(error(format!("Cannot read {name}: {value}")));
     }
-    path.canonicalize()
-        .map_err(|_| error(format!("Cannot read {name}: {value}")))
+    Ok(path)
 }
 
 struct Config {
@@ -117,7 +116,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn resolves_relative_media_path_from_startup_directory() {
@@ -126,5 +128,25 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, root.join("Cargo.toml").canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_symlink_name_in_resolved_media_path() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("owncast-path-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("8f31.mkv"), []).unwrap();
+        symlink("8f31.mkv", root.join("premiere.mkv")).unwrap();
+
+        let resolved = resolve_media_path(&root, "premiere.mkv", "video").unwrap();
+
+        assert_eq!(resolved, root.join("premiere.mkv"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
