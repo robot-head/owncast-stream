@@ -19,6 +19,10 @@
 - Use the approved amber monochrome projection-console layout.
 - Add no crate, audio branch, thread, or custom sample analysis.
 - Malformed level messages leave the previous reading unchanged.
+- Do not read host `/opt/owncast` secrets or contact the host Owncast server.
+- Use synthetic GStreamer sources and `fakesink`; any end-to-end Owncast check
+  must use a disposable Docker instance with dynamically assigned loopback host
+  ports different from the live service ports and generated test credentials.
 
 ---
 
@@ -39,11 +43,19 @@ Add:
 
 ```rust
 #[test]
-fn gain_steps_and_clamps_in_db() {
+fn converts_db_to_amplitude() {
     assert!((db_to_amplitude(0.0) - 1.0).abs() < 0.000001);
     assert!((db_to_amplitude(3.0) - 1.4125375).abs() < 0.000001);
+}
+
+#[test]
+fn gain_steps_one_db() {
     assert_eq!(adjusted_gain_db(3.0, 1), 4.0);
     assert_eq!(adjusted_gain_db(3.0, -1), 2.0);
+}
+
+#[test]
+fn gain_clamps_to_bounds() {
     assert_eq!(adjusted_gain_db(12.0, 1), 12.0);
     assert_eq!(adjusted_gain_db(-12.0, -1), -12.0);
 }
@@ -54,7 +66,9 @@ fn gain_steps_and_clamps_in_db() {
 Run:
 
 ```bash
-cargo test pipeline::tests::gain_steps_and_clamps_in_db --locked
+cargo test pipeline::tests::converts_db_to_amplitude --locked
+cargo test pipeline::tests::gain_steps_one_db --locked
+cargo test pipeline::tests::gain_clamps_to_bounds --locked
 ```
 
 Expected: compile failure because `db_to_amplitude` and `adjusted_gain_db` do not exist.
@@ -82,7 +96,9 @@ fn adjusted_gain_db(current: f64, steps: i8) -> f64 {
 Run:
 
 ```bash
-cargo test pipeline::tests::gain_steps_and_clamps_in_db --locked
+cargo test pipeline::tests::converts_db_to_amplitude --locked
+cargo test pipeline::tests::gain_steps_one_db --locked
+cargo test pipeline::tests::gain_clamps_to_bounds --locked
 ```
 
 Expected: PASS.
@@ -350,11 +366,24 @@ Add:
 
 ```rust
 #[test]
-fn meter_bar_clamps_signal_and_marks_decay_peak() {
+fn meter_bar_places_floor_marker() {
     assert_eq!(meter_bar(10, -60.0, -60.0), "┃·········");
+}
+
+#[test]
+fn meter_bar_fills_to_ceiling() {
     assert_eq!(meter_bar(10, 0.0, 0.0), "█████████┃");
+}
+
+#[test]
+fn meter_bar_fills_to_current_peak() {
     let bar = meter_bar(10, -30.0, -6.0);
     assert_eq!(bar.chars().filter(|cell| *cell == '█').count(), 5);
+}
+
+#[test]
+fn meter_bar_marks_decay_peak() {
+    let bar = meter_bar(10, -30.0, -6.0);
     assert_eq!(bar.chars().position(|cell| cell == '┃'), Some(9));
 }
 ```
@@ -364,7 +393,10 @@ fn meter_bar_clamps_signal_and_marks_decay_peak() {
 Run:
 
 ```bash
-cargo test ui::tests::meter_bar_clamps_signal_and_marks_decay_peak --locked
+cargo test ui::tests::meter_bar_places_floor_marker --locked
+cargo test ui::tests::meter_bar_fills_to_ceiling --locked
+cargo test ui::tests::meter_bar_fills_to_current_peak --locked
+cargo test ui::tests::meter_bar_marks_decay_peak --locked
 ```
 
 Expected: compile failure because `meter_bar` does not exist.
@@ -397,7 +429,10 @@ fn meter_bar(width: usize, peak: f64, decay: f64) -> String {
 Run:
 
 ```bash
-cargo test ui::tests::meter_bar_clamps_signal_and_marks_decay_peak --locked
+cargo test ui::tests::meter_bar_places_floor_marker --locked
+cargo test ui::tests::meter_bar_fills_to_ceiling --locked
+cargo test ui::tests::meter_bar_fills_to_current_peak --locked
+cargo test ui::tests::meter_bar_marks_decay_peak --locked
 ```
 
 Expected: PASS.

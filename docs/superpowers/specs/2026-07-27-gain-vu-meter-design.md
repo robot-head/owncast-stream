@@ -77,6 +77,13 @@ No new crate, audio branch, thread, or custom sample analysis is added.
 
 ## Verification
 
+Tests must not read the host `/opt/owncast` secrets or send stream/title data to
+the Owncast server running on this machine. Unit and integration tests use
+synthetic GStreamer sources and `fakesink`. If an end-to-end Owncast check is
+needed, run a disposable Docker Owncast instance with dynamically assigned
+loopback host ports that differ from the live service ports, use generated test
+credentials, then remove it.
+
 Tests cover:
 
 - Up and Down key mapping in every playback state
