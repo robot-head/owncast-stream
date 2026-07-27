@@ -36,12 +36,34 @@ the ceiling.
 
 ## Terminal layout
 
-Keep the existing title, playback state, position, duration, and help. Add the
-signed gain beside playback status, followed by separate `L` and `R` horizontal
-meters scaled from -60 to 0 dB. Each meter shows the current peak as its filled
-bar and the held/decaying peak as a marker.
+Restyle the full-screen TUI after the supplied IMAX projection-console
+reference:
 
-The help line adds `↑/↓ Gain`.
+- amber monochrome foreground and borders on black
+- dense square-cornered control panels
+- inverted amber status strips
+- double-bordered, centered playback-state banner
+- uppercase monospaced labels and values
+
+The wide layout has a main console and a narrower right status rail. The main
+console contains:
+
+1. `OWNCAST` and `SHOW LOCAL - AUTO MODE` header
+2. bordered `SHOW INFORMATION` title panel
+3. inverted playback/stream status strip
+4. elapsed time, duration, and signed gain row
+5. bordered `PROGRAM AUDIO / 3 SEC PEAK HOLD` panel with separate `L` and `R`
+   horizontal meters scaled from -60 to 0 dB
+6. double-bordered `LOBBY`, `PLAYING`, or `PAUSED` banner
+7. five bordered key panels for Enter, Space, Left/Right, Up/Down, and Q
+
+Each meter shows the current peak as its filled bar, the held/decaying peak as a
+marker, and the current numeric dB value. The right rail shows compact stream
+state indicators, the current gain, and held left/right peak values.
+
+When the terminal is too narrow for two columns, stack the status rail below the
+main console. The central title, state, time, gain, meters, and key help must
+remain visible; decorative labels may shorten before data is clipped.
 
 ## Code boundaries
 
