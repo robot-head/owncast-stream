@@ -15,6 +15,33 @@ use crate::{
 };
 
 const INTER_CHANNEL: &str = "owncast-movie";
+const DEFAULT_GAIN_DB: f64 = 3.0;
+const MIN_GAIN_DB: f64 = -12.0;
+const MAX_GAIN_DB: f64 = 12.0;
+
+fn db_to_amplitude(db: f64) -> f64 {
+    10.0_f64.powf(db / 20.0)
+}
+
+fn adjusted_gain_db(current: f64, steps: i8) -> f64 {
+    (current + f64::from(steps)).clamp(MIN_GAIN_DB, MAX_GAIN_DB)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AudioLevels {
+    pub(crate) peak: [f64; 2],
+    pub(crate) decay: [f64; 2],
+}
+
+impl Default for AudioLevels {
+    fn default() -> Self {
+        Self {
+            peak: [-60.0; 2],
+            decay: [-60.0; 2],
+        }
+    }
+}
+
 const REQUIRED_ELEMENTS: &[&str] = &[
     "uridecodebin3",
     "videotestsrc",
@@ -40,6 +67,7 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "audiocheblimit",
     "audiodynamic",
     "volume",
+    "level",
     "x264enc",
     "h264parse",
     "avenc_aac",
@@ -88,6 +116,25 @@ fn bus_error(message: &gst::MessageRef) -> Option<String> {
     }
 }
 
+fn stereo_values(structure: &gst::StructureRef, field: &str) -> Option<[f64; 2]> {
+    let values = structure.get::<gst::glib::ValueArray>(field).ok()?;
+    Some([
+        values.first()?.get::<f64>().ok()?,
+        values.get(1)?.get::<f64>().ok()?,
+    ])
+}
+
+fn parse_audio_levels(message: &gst::MessageRef) -> Option<AudioLevels> {
+    let structure = message.structure()?;
+    if structure.name() != "level" {
+        return None;
+    }
+    Some(AudioLevels {
+        peak: stereo_values(structure, "peak")?,
+        decay: stereo_values(structure, "decay")?,
+    })
+}
+
 fn candidate(stream: &gst::Stream) -> Option<StreamCandidate> {
     let kind = if stream.stream_type().contains(gst::StreamType::VIDEO) {
         StreamKind::Video
@@ -129,6 +176,7 @@ struct BroadcastPipeline {
     pipeline: gst::Pipeline,
     video_selector: gst::Element,
     audio_selector: gst::Element,
+    audio_gain: gst::Element,
     freeze_bin: gst::Bin,
     freeze_source: gst::Element,
     latest_frame: Arc<Mutex<Option<gst::Buffer>>>,
@@ -195,7 +243,9 @@ impl BroadcastPipeline {
               ! audiocheblimit mode=high-pass cutoff=80 poles=4
               ! audiodynamic mode=compressor characteristics=soft-knee
                   threshold=0.125 ratio=2.0
-              ! volume name=audio_gain volume=1.4125375
+              ! volume name=audio_gain
+              ! level name=audio_meter interval=100000000
+                  peak-ttl=3000000000 peak-falloff=12 post-messages=true
               ! avenc_aac name=audio_encoder bitrate=192000
               ! aacparse name=audio_parser
               ! queue name=audio_output_queue
@@ -213,6 +263,10 @@ impl BroadcastPipeline {
         let audio_selector = pipeline
             .by_name("audio_selector")
             .ok_or_else(|| error("Audio selector is missing"))?;
+        let audio_gain = pipeline
+            .by_name("audio_gain")
+            .ok_or_else(|| error("Audio gain is missing"))?;
+        audio_gain.set_property("volume", db_to_amplitude(DEFAULT_GAIN_DB));
         let video_lobby_pad = video_selector
             .static_pad("sink_0")
             .ok_or_else(|| error("Video lobby pad is missing"))?;
@@ -263,6 +317,7 @@ impl BroadcastPipeline {
             pipeline,
             video_selector,
             audio_selector,
+            audio_gain,
             freeze_bin,
             freeze_source,
             latest_frame,
@@ -659,6 +714,8 @@ pub(crate) struct StreamSession {
     broadcast: BroadcastPipeline,
     playback: PlaybackPipeline,
     state: PlaybackState,
+    gain_db: f64,
+    levels: AudioLevels,
     title: String,
     title_token: String,
     subtitles: Option<std::path::PathBuf>,
@@ -695,6 +752,8 @@ impl StreamSession {
             broadcast,
             playback,
             state: PlaybackState::Lobby,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
             title: media.title.clone(),
             title_token: config.title_token.clone(),
             subtitles: config.subtitles.clone(),
@@ -716,6 +775,21 @@ impl StreamSession {
 
     pub(crate) fn state(&self) -> PlaybackState {
         self.state
+    }
+
+    pub(crate) fn gain_db(&self) -> f64 {
+        self.gain_db
+    }
+
+    pub(crate) fn levels(&self) -> AudioLevels {
+        self.levels
+    }
+
+    pub(crate) fn adjust_gain(&mut self, steps: i8) {
+        self.gain_db = adjusted_gain_db(self.gain_db, steps);
+        self.broadcast
+            .audio_gain
+            .set_property("volume", db_to_amplitude(self.gain_db));
     }
 
     pub(crate) fn title(&self) -> &str {
@@ -790,7 +864,7 @@ impl StreamSession {
         Ok(())
     }
 
-    pub(crate) fn poll(&self) -> Result<SessionEvent, Box<dyn Error>> {
+    pub(crate) fn poll(&mut self) -> Result<SessionEvent, Box<dyn Error>> {
         while gst::glib::MainContext::default().pending() {
             gst::glib::MainContext::default().iteration(false);
         }
@@ -819,6 +893,10 @@ impl StreamSession {
             .bus()
             .ok_or_else(|| error("Broadcast bus is missing"))?;
         while let Some(message) = broadcast_bus.timed_pop(gst::ClockTime::ZERO) {
+            if let Some(levels) = parse_audio_levels(&message) {
+                self.levels = levels;
+                continue;
+            }
             if let Some(failure) = bus_error(&message) {
                 return Err(error(failure));
             }
@@ -853,6 +931,62 @@ mod tests {
             stream_key: String::new(),
             title_token: String::new(),
         }
+    }
+
+    #[test]
+    fn converts_db_to_amplitude() {
+        assert!((db_to_amplitude(0.0) - 1.0).abs() < 0.000001);
+        assert!((db_to_amplitude(3.0) - 1.4125375).abs() < 0.000001);
+    }
+
+    #[test]
+    fn gain_steps_one_db() {
+        assert_eq!(adjusted_gain_db(3.0, 1), 4.0);
+        assert_eq!(adjusted_gain_db(3.0, -1), 2.0);
+    }
+
+    #[test]
+    fn gain_clamps_to_bounds() {
+        assert_eq!(adjusted_gain_db(12.0, 1), 12.0);
+        assert_eq!(adjusted_gain_db(-12.0, -1), -12.0);
+    }
+
+    #[test]
+    fn parses_stereo_peak_and_decay_from_level_message() {
+        let _gst = gst_test();
+        let mut structure = gst::Structure::new_empty("level");
+        // SAFETY: Both arrays contain only `f64`, which is `Send`.
+        unsafe {
+            structure.set_value(
+                "peak",
+                gst::glib::ValueArray::new([-4.2_f64, -6.1])
+                    .to_value()
+                    .into_send_value(),
+            );
+            structure.set_value(
+                "decay",
+                gst::glib::ValueArray::new([-2.8_f64, -3.4])
+                    .to_value()
+                    .into_send_value(),
+            );
+        }
+        let message = gst::message::Element::new(structure);
+
+        assert_eq!(
+            parse_audio_levels(&message),
+            Some(AudioLevels {
+                peak: [-4.2, -6.1],
+                decay: [-2.8, -3.4],
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_level_message() {
+        let _gst = gst_test();
+        let message = gst::message::Element::new(gst::Structure::new_empty("level"));
+
+        assert_eq!(parse_audio_levels(&message), None);
     }
 
     #[test]
@@ -908,8 +1042,15 @@ mod tests {
             broadcast.audio_selector.property::<gst::Pad>("active-pad"),
             broadcast.audio_lobby_pad
         );
-        let gain = broadcast.pipeline.by_name("audio_gain").unwrap();
-        assert!((gain.property::<f64>("volume") - 1.4125375).abs() < 0.000001);
+        let meter = broadcast.pipeline.by_name("audio_meter").unwrap();
+        assert_eq!(meter.property::<u64>("interval"), 100_000_000);
+        assert_eq!(meter.property::<u64>("peak-ttl"), 3_000_000_000);
+        assert_eq!(meter.property::<f64>("peak-falloff"), 12.0);
+        assert!(meter.property::<bool>("post-messages"));
+        assert!(
+            (broadcast.audio_gain.property::<f64>("volume") - db_to_amplitude(3.0)).abs()
+                < 0.000001
+        );
     }
 
     #[test]
@@ -1058,6 +1199,8 @@ mod tests {
             broadcast,
             playback,
             state: PlaybackState::Playing,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
             subtitles: None,
@@ -1139,6 +1282,8 @@ mod tests {
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
             playback,
             state: PlaybackState::Playing,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
             subtitles: None,
@@ -1200,6 +1345,8 @@ mod tests {
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
             playback,
             state: PlaybackState::Playing,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
             subtitles: None,
