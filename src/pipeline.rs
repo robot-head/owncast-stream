@@ -56,6 +56,14 @@ fn candidate(stream: &gst::Stream) -> Option<StreamCandidate> {
     } else {
         return None;
     };
+    if kind == StreamKind::Subtitle
+        && stream.caps().is_some_and(|caps| {
+            caps.structure(0)
+                .is_some_and(|structure| structure.name().as_str().starts_with("subpicture/"))
+        })
+    {
+        return None;
+    }
     let tags = stream.tags();
     let language = tags
         .as_ref()
@@ -1457,6 +1465,20 @@ mod tests {
                 is_sdh: false,
             })
         );
+    }
+
+    #[test]
+    fn ignores_bitmap_subtitle_streams() {
+        let _gst = gst_test();
+        let caps = gst::Caps::builder("subpicture/x-pgs").build();
+        let stream = gst::Stream::new(
+            Some("subtitle-1"),
+            Some(&caps),
+            gst::StreamType::TEXT,
+            gst::StreamFlags::empty(),
+        );
+
+        assert_eq!(candidate(&stream), None);
     }
 
     #[test]

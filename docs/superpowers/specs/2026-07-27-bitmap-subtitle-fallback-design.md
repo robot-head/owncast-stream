@@ -2,19 +2,18 @@
 
 ## Problem
 
-`owncast-stream` sends every embedded subtitle stream to FFmpeg's text-only
-`subtitles` filter. Blu-ray PGS tracks therefore stop the movie encoder before
-handoff and leave the lobby live.
+`owncast-stream` selects every English embedded subtitle stream. This host has
+no GStreamer PGS decoder, so selecting a Blu-ray PGS stream prevents the movie
+pipeline from reaching handoff and leaves the lobby live.
 
 ## Design
 
-Subtitle selection will ignore embedded bitmap codecs. It will retain the
-existing preference order among supported embedded text tracks: English first,
-then the first supported track. If none remain, the existing external subtitle
-argument is used; without one, the movie streams without burned subtitles.
+The GStreamer stream-candidate boundary will ignore subtitle caps in the
+`subpicture/*` family. Existing stream selection then uses an external subtitle
+when supplied or streams without burned subtitles.
 
-The codec check belongs in `select_subtitle`, the shared selection boundary.
-No FFmpeg retry, subtitle conversion, OCR, or new dependency is needed.
+No decoder installation, retry, subtitle conversion, OCR, or new dependency is
+needed.
 
 ## Error Handling
 
@@ -23,6 +22,6 @@ existing process and handoff errors remain unchanged.
 
 ## Testing
 
-A unit regression test will supply an English `hdmv_pgs_subtitle` stream before
-a supported text stream and verify the bitmap track is skipped. Existing unit
-and integration tests will verify preference order and continuous handoff.
+A unit regression test will supply a GStreamer text stream with
+`subpicture/x-pgs` caps and verify the candidate is rejected. Existing unit and
+integration tests will verify stream selection and continuous handoff.
