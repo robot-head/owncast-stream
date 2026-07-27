@@ -124,7 +124,7 @@ fn stereo_values(structure: &gst::StructureRef, field: &str) -> Option<[f64; 2]>
     ];
     values
         .iter()
-        .all(|value| value.is_finite())
+        .all(|value| value.is_finite() || *value == f64::NEG_INFINITY)
         .then(|| values.map(|value| value.clamp(-60.0, 0.0)))
 }
 
@@ -1005,6 +1005,34 @@ mod tests {
     }
 
     #[test]
+    fn session_gain_updates_volume_and_clamps_repeated_commands() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+
+        session.adjust_gain(1);
+        assert_eq!(session.gain_db(), 4.0);
+        assert!(
+            (session.broadcast.audio_gain.property::<f64>("volume") - 1.584893192).abs() < 0.000001
+        );
+
+        for _ in 0..30 {
+            session.adjust_gain(1);
+        }
+        assert_eq!(session.gain_db(), 12.0);
+        assert!(
+            (session.broadcast.audio_gain.property::<f64>("volume") - 3.981071706).abs() < 0.000001
+        );
+
+        for _ in 0..30 {
+            session.adjust_gain(-1);
+        }
+        assert_eq!(session.gain_db(), -12.0);
+        assert!(
+            (session.broadcast.audio_gain.property::<f64>("volume") - 0.251188643).abs() < 0.000001
+        );
+    }
+
+    #[test]
     fn parses_stereo_peak_and_decay_from_level_message() {
         let _gst = gst_test();
         let message = level_message([-4.2, -6.1], [-2.8, -3.4]);
@@ -1033,6 +1061,20 @@ mod tests {
     }
 
     #[test]
+    fn maps_negative_infinity_silence_to_floor() {
+        let _gst = gst_test();
+        let message = level_message([f64::NEG_INFINITY, -4.0], [-3.0, f64::NEG_INFINITY]);
+
+        assert_eq!(
+            parse_audio_levels(&message),
+            Some(AudioLevels {
+                peak: [-60.0, -4.0],
+                decay: [-3.0, -60.0],
+            })
+        );
+    }
+
+    #[test]
     fn clamps_audio_levels_above_zero() {
         let _gst = gst_test();
         let message = level_message([1.0, 12.0], [0.1, 3.0]);
@@ -1049,7 +1091,7 @@ mod tests {
     #[test]
     fn rejects_non_finite_audio_levels() {
         let _gst = gst_test();
-        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for value in [f64::NAN, f64::INFINITY] {
             let message = level_message([value, -4.0], [-3.0, -5.0]);
 
             assert_eq!(parse_audio_levels(&message), None);

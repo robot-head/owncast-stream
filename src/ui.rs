@@ -255,14 +255,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, status: &Status<'_>) {
         area,
     );
     let wide = area.width >= 90;
-    let direction = if wide {
+    let rail_beside = wide || area.height < 34;
+    let direction = if rail_beside {
         Direction::Horizontal
     } else {
         Direction::Vertical
     };
     let sections = Layout::default()
         .direction(direction)
-        .constraints(if wide {
+        .constraints(if rail_beside {
             [Constraint::Ratio(3, 4), Constraint::Ratio(1, 4)]
         } else {
             [Constraint::Min(23), Constraint::Length(11)]
@@ -556,6 +557,62 @@ mod tests {
             assert!(
                 rail.contains(required),
                 "missing stacked rail value {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_80x24_console_keeps_status_meter_gain_and_controls_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &status())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let status_area = region_text(buffer, Rect::new(0, 4, 60, 2));
+        let meter_area = region_text(buffer, Rect::new(0, 6, 60, 6));
+        let controls_area = region_text(buffer, Rect::new(0, 15, 60, 9));
+        let rail = region_text(buffer, Rect::new(60, 0, 20, 24));
+
+        for required in ["STATUS: PLAYING", "GAIN +3 dB", "00:42:18 / 01:47:03"] {
+            assert!(
+                status_area.contains(required),
+                "missing status value {required}"
+            );
+        }
+        for required in ["PROGRAM AUDIO", "L ", "-4.2 dB", "R ", "-6.1 dB"] {
+            assert!(
+                meter_area.contains(required),
+                "missing stereo meter value {required}"
+            );
+        }
+        for required in [
+            "ENTER",
+            "START",
+            "SPACE",
+            "PAUSE / RESUME",
+            "← / →",
+            "JUMP 30 SEC",
+            "↑ / ↓",
+            "GAIN 1 dB",
+            "Q",
+            "EXIT SHOW",
+        ] {
+            assert!(
+                controls_area.contains(required),
+                "missing unclipped control help {required}"
+            );
+        }
+        for required in [
+            "SYSTEM",
+            "STREAM READY",
+            "PLAYING",
+            "GAIN VALUE",
+            "+3 dB",
+            "PEAK VALUES",
+            "L  -2.8 dB",
+            "R  -3.4 dB",
+        ] {
+            assert!(
+                rail.contains(required),
+                "missing compact rail value {required}"
             );
         }
     }
