@@ -14,12 +14,17 @@ Implement on `feat/playback-controls`, created directly from merged
 
 Add only:
 
-- `ratatui = "0.30.2"` for terminal rendering and input;
+- `ratatui = { version = "0.30.2", default-features = false, features =
+  ["crossterm"] }` for terminal rendering and input;
 - `gstreamer-pbutils = "0.25"` for synchronous metadata and duration discovery;
 - `torrent-name-parser = "0.12.1"` for filename fallback titles.
 
 Use Ratatui's re-exported Crossterm API rather than adding Crossterm
 separately.
+
+Correct the README's minimum Rust version to 1.92: the existing
+`gstreamer = "0.25"` dependency already requires it, so this feature does not
+raise the actual toolchain floor.
 
 ## Media discovery and title
 
