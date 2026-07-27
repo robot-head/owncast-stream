@@ -12,7 +12,7 @@ while switching from a generated lobby to one movie.
 - Continuous lobby-to-movie handoff without reconnecting viewers
 - Pause with a frozen movie frame and silence while the RTMP stream stays live
 - 30-second forward and backward seeking
-- Ratatui title, playback state, position, and duration display
+- Amber projection-console TUI with playback status, gain, and stereo peak meters
 - Owncast title updates through a native Rust HTTP client
 - Clean lifecycle messages
 
@@ -51,7 +51,11 @@ Controls:
 - Enter starts the movie from the lobby.
 - Space pauses or resumes playback.
 - Left and Right seek backward or forward 30 seconds.
+- Up and Down adjust gain by 1 dB from -12 dB to +12 dB.
 - `q` or Ctrl-C quits.
+
+The stereo VU meter shows the post-gain signal from -60 dB to 0 dB. Peak
+markers hold for 3 seconds, then decay at 12 dB per second.
 
 When `TITLE` is omitted, the title comes from embedded media metadata, then a
 cleaned filename from `torrent-name-parser`, then the raw filename stem.
