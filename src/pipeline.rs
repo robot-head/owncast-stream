@@ -910,9 +910,7 @@ impl StreamSession {
             return Ok(());
         }
         let target = seek_target(self.position(), self.duration, seconds);
-        if self.state == PlaybackState::Paused && target == self.duration {
-            return Ok(());
-        }
+        let keep_last_frame = self.state == PlaybackState::Paused && target == self.duration;
         let generation = self.playback.frame_generation();
         self.playback
             .pipeline
@@ -922,6 +920,9 @@ impl StreamSession {
                 .pipeline
                 .state(gst::ClockTime::from_seconds(5))
                 .0?;
+            if keep_last_frame {
+                return Ok(());
+            }
             let frame = self
                 .playback
                 .wait_for_frame_after(generation, Duration::from_secs(1))?;
@@ -976,7 +977,7 @@ mod tests {
     use super::*;
     use std::{
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     static GST_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1271,16 +1272,34 @@ mod tests {
             .unwrap();
         session.start_transition(Duration::from_secs(1)).unwrap();
         session.toggle_pause().unwrap();
-        let generation = session.playback.frame_generation();
         let selected = session
             .broadcast
             .video_selector
             .property::<gst::Pad>("active-pad");
+        let sought = Arc::new(AtomicBool::new(false));
+        let observed_seek = sought.clone();
+        session
+            .playback
+            .pipeline
+            .by_name("movie_video_output")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                if matches!(
+                    info.event().map(|event| event.view()),
+                    Some(gst::EventView::Seek(_))
+                ) {
+                    observed_seek.store(true, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
 
         session.seek_by(30).unwrap();
 
+        assert!(sought.load(Ordering::Relaxed));
         assert_eq!(session.state(), PlaybackState::Paused);
-        assert_eq!(session.playback.frame_generation(), generation);
         assert_eq!(
             session
                 .broadcast
