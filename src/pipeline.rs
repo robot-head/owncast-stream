@@ -118,10 +118,14 @@ fn bus_error(message: &gst::MessageRef) -> Option<String> {
 
 fn stereo_values(structure: &gst::StructureRef, field: &str) -> Option<[f64; 2]> {
     let values = structure.get::<gst::glib::ValueArray>(field).ok()?;
-    Some([
+    let values = [
         values.first()?.get::<f64>().ok()?,
         values.get(1)?.get::<f64>().ok()?,
-    ])
+    ];
+    values
+        .iter()
+        .all(|value| value.is_finite())
+        .then(|| values.map(|value| value.clamp(-60.0, 0.0)))
 }
 
 fn parse_audio_levels(message: &gst::MessageRef) -> Option<AudioLevels> {
@@ -933,6 +937,55 @@ mod tests {
         }
     }
 
+    fn level_message(peak: [f64; 2], decay: [f64; 2]) -> gst::Message {
+        let mut structure = gst::Structure::new_empty("level");
+        // SAFETY: Both arrays contain only `f64`, which is `Send`.
+        unsafe {
+            structure.set_value(
+                "peak",
+                gst::glib::ValueArray::new(peak)
+                    .to_value()
+                    .into_send_value(),
+            );
+            structure.set_value(
+                "decay",
+                gst::glib::ValueArray::new(decay)
+                    .to_value()
+                    .into_send_value(),
+            );
+        }
+        gst::message::Element::new(structure)
+    }
+
+    fn session_with_fakesink() -> StreamSession {
+        let pipeline = gst::Pipeline::new();
+        let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
+        let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        pipeline.add_many([&movie, &subtitle_overlay]).unwrap();
+        StreamSession {
+            broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
+            playback: PlaybackPipeline {
+                pipeline,
+                movie,
+                subtitle_overlay,
+                sinks: SelectedSinks {
+                    video: gst::Pad::new(gst::PadDirection::Sink),
+                    audio: gst::Pad::new(gst::PadDirection::Sink),
+                    subtitle: gst::Pad::new(gst::PadDirection::Sink),
+                },
+                selection: Arc::new(OnceLock::new()),
+                setup: Arc::new(Mutex::new(SetupState::default())),
+            },
+            state: PlaybackState::Lobby,
+            gain_db: DEFAULT_GAIN_DB,
+            levels: AudioLevels::default(),
+            title: "Passenger".into(),
+            title_token: String::new(),
+            subtitles: None,
+            duration: gst::ClockTime::from_seconds(100),
+        }
+    }
+
     #[test]
     fn converts_db_to_amplitude() {
         assert!((db_to_amplitude(0.0) - 1.0).abs() < 0.000001);
@@ -954,23 +1007,7 @@ mod tests {
     #[test]
     fn parses_stereo_peak_and_decay_from_level_message() {
         let _gst = gst_test();
-        let mut structure = gst::Structure::new_empty("level");
-        // SAFETY: Both arrays contain only `f64`, which is `Send`.
-        unsafe {
-            structure.set_value(
-                "peak",
-                gst::glib::ValueArray::new([-4.2_f64, -6.1])
-                    .to_value()
-                    .into_send_value(),
-            );
-            structure.set_value(
-                "decay",
-                gst::glib::ValueArray::new([-2.8_f64, -3.4])
-                    .to_value()
-                    .into_send_value(),
-            );
-        }
-        let message = gst::message::Element::new(structure);
+        let message = level_message([-4.2, -6.1], [-2.8, -3.4]);
 
         assert_eq!(
             parse_audio_levels(&message),
@@ -982,11 +1019,71 @@ mod tests {
     }
 
     #[test]
+    fn clamps_silent_audio_levels_to_floor() {
+        let _gst = gst_test();
+        let message = level_message([-90.0, -60.0], [-120.0, -61.0]);
+
+        assert_eq!(
+            parse_audio_levels(&message),
+            Some(AudioLevels {
+                peak: [-60.0, -60.0],
+                decay: [-60.0, -60.0],
+            })
+        );
+    }
+
+    #[test]
+    fn clamps_audio_levels_above_zero() {
+        let _gst = gst_test();
+        let message = level_message([1.0, 12.0], [0.1, 3.0]);
+
+        assert_eq!(
+            parse_audio_levels(&message),
+            Some(AudioLevels {
+                peak: [0.0, 0.0],
+                decay: [0.0, 0.0],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_audio_levels() {
+        let _gst = gst_test();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let message = level_message([value, -4.0], [-3.0, -5.0]);
+
+            assert_eq!(parse_audio_levels(&message), None);
+        }
+    }
+
+    #[test]
     fn ignores_malformed_level_message() {
         let _gst = gst_test();
         let message = gst::message::Element::new(gst::Structure::new_empty("level"));
 
         assert_eq!(parse_audio_levels(&message), None);
+    }
+
+    #[test]
+    fn poll_preserves_levels_after_invalid_message() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+        let previous = AudioLevels {
+            peak: [-4.0, -5.0],
+            decay: [-2.0, -3.0],
+        };
+        session.levels = previous;
+        session
+            .broadcast
+            .pipeline
+            .bus()
+            .unwrap()
+            .post(level_message([f64::NAN, -4.0], [-3.0, -5.0]))
+            .unwrap();
+
+        session.poll().unwrap();
+
+        assert_eq!(session.levels(), previous);
     }
 
     #[test]
