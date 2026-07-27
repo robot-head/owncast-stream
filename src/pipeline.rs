@@ -1226,8 +1226,6 @@ mod tests {
             .set_state(gst::State::Playing)
             .unwrap();
         session.start_transition(Duration::from_secs(1)).unwrap();
-        session.toggle_pause().unwrap();
-        let generation = session.playback.frame_generation();
         let frozen = Arc::new(Mutex::new(None));
         let captured = frozen.clone();
         session
@@ -1244,6 +1242,13 @@ mod tests {
                 gst::PadProbeReturn::Ok
             })
             .unwrap();
+        session.toggle_pause().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while frozen.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(frozen.lock().unwrap().take().is_some());
+        let generation = session.playback.frame_generation();
 
         session.seek_by(3).unwrap();
 
@@ -1271,7 +1276,25 @@ mod tests {
             .set_state(gst::State::Playing)
             .unwrap();
         session.start_transition(Duration::from_secs(1)).unwrap();
+        let freezes = Arc::new(AtomicU64::new(0));
+        let counted_freezes = freezes.clone();
+        session
+            .broadcast
+            .freeze_source
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counted_freezes.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
         session.toggle_pause().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while freezes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let freeze_count = freezes.load(Ordering::Relaxed);
+        assert!(freeze_count > 0);
         let selected = session
             .broadcast
             .video_selector
@@ -1297,8 +1320,10 @@ mod tests {
             .unwrap();
 
         session.seek_by(30).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
 
         assert!(sought.load(Ordering::Relaxed));
+        assert_eq!(freezes.load(Ordering::Relaxed), freeze_count);
         assert_eq!(session.state(), PlaybackState::Paused);
         assert_eq!(
             session
