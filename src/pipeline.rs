@@ -3,7 +3,6 @@ use gstreamer as gst;
 use std::{
     env,
     error::Error,
-    io,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -133,7 +132,6 @@ struct BroadcastPipeline {
     freeze_bin: gst::Bin,
     freeze_source: gst::Element,
     latest_frame: Arc<Mutex<Option<gst::Buffer>>>,
-    video_lobby_pad: gst::Pad,
     audio_lobby_pad: gst::Pad,
     video_movie_pad: gst::Pad,
     audio_movie_pad: gst::Pad,
@@ -268,7 +266,6 @@ impl BroadcastPipeline {
             freeze_bin,
             freeze_source,
             latest_frame,
-            video_lobby_pad,
             audio_lobby_pad,
             video_movie_pad,
             audio_movie_pad,
@@ -830,19 +827,6 @@ impl StreamSession {
     }
 }
 
-pub(crate) fn run(config: &Config, media: &MediaInfo) -> Result<(), Box<dyn Error>> {
-    let mut session = StreamSession::new(config, media)?;
-    println!("Lobby is live. Press Enter to start \"{}\"...", media.title);
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    session.start()?;
-    println!("Movie is live.");
-    while matches!(session.poll()?, SessionEvent::Running) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,8 +898,11 @@ mod tests {
         assert!(playback.pipeline.by_name("movie_audio_output").is_some());
         assert!(playback.pipeline.by_name("output").is_none());
         assert_eq!(
-            broadcast.video_selector.property::<gst::Pad>("active-pad"),
-            broadcast.video_lobby_pad
+            broadcast
+                .video_selector
+                .property::<gst::Pad>("active-pad")
+                .name(),
+            "sink_0"
         );
         assert_eq!(
             broadcast.audio_selector.property::<gst::Pad>("active-pad"),

@@ -107,7 +107,8 @@ fn main() {
     }
     let result = Config::parse(args.into_iter()).and_then(|config| {
         let media = media::discover(&config.video, config.title.as_deref())?;
-        pipeline::run(&config, &media)
+        let mut session = pipeline::StreamSession::new(&config, &media)?;
+        ratatui::run(|terminal| ui::run(terminal, &mut session))
     });
     if let Err(failure) = result {
         eprintln!("{failure}");

@@ -1,5 +1,13 @@
 use gstreamer as gst;
-use ratatui::{Frame, crossterm::event::KeyCode, text::Line, widgets::Paragraph};
+use ratatui::{
+    DefaultTerminal, Frame,
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    text::Line,
+    widgets::Paragraph,
+};
+use std::{error::Error, time::Duration};
+
+use crate::pipeline::{SessionEvent, StreamSession};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlaybackState {
@@ -71,6 +79,47 @@ pub(crate) fn render(frame: &mut Frame<'_>, status: &Status<'_>) {
         ]),
         frame.area(),
     );
+}
+
+pub(crate) fn run(
+    terminal: &mut DefaultTerminal,
+    session: &mut StreamSession,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        if matches!(session.poll()?, SessionEvent::Finished) {
+            return Ok(());
+        }
+        terminal.draw(|frame| {
+            render(
+                frame,
+                &Status {
+                    title: session.title(),
+                    state: session.state(),
+                    position: session.position(),
+                    duration: session.duration(),
+                },
+            );
+        })?;
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(());
+        }
+        match command_for_key(session.state(), key.code) {
+            Some(Command::Start) => session.start()?,
+            Some(Command::TogglePause) => session.toggle_pause()?,
+            Some(Command::Seek(seconds)) => session.seek_by(seconds)?,
+            Some(Command::Quit) => return Ok(()),
+            None => {}
+        }
+    }
 }
 
 #[cfg(test)]
