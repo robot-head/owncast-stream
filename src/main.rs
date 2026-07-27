@@ -119,22 +119,25 @@ impl Media {
     }
 }
 
+fn is_text_subtitle(stream: &Stream) -> bool {
+    !matches!(
+        stream.codec_name.as_deref(),
+        Some("dvd_subtitle" | "dvb_subtitle" | "xsub" | "hdmv_pgs_subtitle")
+    )
+}
+
 fn select_subtitle(streams: &[Stream]) -> Option<usize> {
-    if streams.is_empty() {
-        return None;
-    }
-    Some(
-        streams
-            .iter()
-            .position(|stream| {
-                stream
+    streams
+        .iter()
+        .position(|stream| {
+            is_text_subtitle(stream)
+                && stream
                     .tags
                     .as_ref()
                     .and_then(|tags| tags.language.as_deref())
                     == Some("eng")
-            })
-            .unwrap_or(0),
-    )
+        })
+        .or_else(|| streams.iter().position(is_text_subtitle))
 }
 
 #[derive(Serialize)]
@@ -434,8 +437,9 @@ fn main() {
 mod tests {
     use ffprobe::{Stream, StreamTags};
 
-    fn subtitle(language: &str) -> Stream {
+    fn subtitle(codec: &str, language: &str) -> Stream {
         Stream {
+            codec_name: Some(codec.into()),
             codec_type: Some("subtitle".into()),
             tags: Some(StreamTags {
                 language: Some(language.into()),
@@ -448,14 +452,25 @@ mod tests {
     #[test]
     fn prefers_english_embedded_subtitles() {
         assert_eq!(
-            super::select_subtitle(&[subtitle("spa"), subtitle("eng")]),
+            super::select_subtitle(&[subtitle("subrip", "spa"), subtitle("subrip", "eng")]),
             Some(1)
         );
     }
 
     #[test]
     fn falls_back_to_first_embedded_subtitle() {
-        assert_eq!(super::select_subtitle(&[subtitle("spa")]), Some(0));
+        assert_eq!(
+            super::select_subtitle(&[subtitle("subrip", "spa")]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn ignores_bitmap_embedded_subtitles() {
+        assert_eq!(
+            super::select_subtitle(&[subtitle("hdmv_pgs_subtitle", "eng")]),
+            None
+        );
     }
 
     #[test]
