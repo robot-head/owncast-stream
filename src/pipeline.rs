@@ -1017,6 +1017,7 @@ pub(crate) struct StreamSession {
     levels: AudioLevels,
     title: String,
     title_token: String,
+    title_url: String,
     subtitles: Option<std::path::PathBuf>,
     duration: gst::ClockTime,
 }
@@ -1037,11 +1038,15 @@ fn seek_target(
 
 impl StreamSession {
     pub(crate) fn new(config: &Config, media: &MediaInfo) -> Result<Self, Box<dyn Error>> {
-        let output_url = env::var("OWNCAST_OUTPUT_URL")
-            .unwrap_or_else(|_| format!("rtmp://127.0.0.1/live/{}", config.stream_key));
+        let output_url = format!(
+            "{}/{}",
+            config.rtmp_url.trim_end_matches('/'),
+            config.stream_key
+        );
         let broadcast = BroadcastPipeline::build(&output_url)?;
         let playback = PlaybackPipeline::build(config)?;
         set_title(
+            &config.title_url,
             &config.title_token,
             &format!("Starting soon: {}", media.title),
         )?;
@@ -1061,6 +1066,7 @@ impl StreamSession {
             levels: AudioLevels::default(),
             title: media.title.clone(),
             title_token: config.title_token.clone(),
+            title_url: config.title_url.clone(),
             subtitles: config.subtitles.clone(),
             duration: media.duration,
         })
@@ -1072,7 +1078,7 @@ impl StreamSession {
         }
         self.playback.wait_ready(self.subtitles.as_deref())?;
         self.start_transition(Duration::from_secs(1))?;
-        set_title(&self.title_token, &self.title)?;
+        set_title(&self.title_url, &self.title_token, &self.title)?;
         Ok(())
     }
 
@@ -1240,6 +1246,8 @@ mod tests {
             title: None,
             stream_key: String::new(),
             title_token: String::new(),
+            rtmp_url: String::new(),
+            title_url: String::new(),
         }
     }
 
@@ -1290,6 +1298,7 @@ mod tests {
             levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
+            title_url: String::new(),
             subtitles: None,
             duration: gst::ClockTime::from_seconds(100),
         }
@@ -1381,6 +1390,7 @@ mod tests {
             levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
+            title_url: String::new(),
             subtitles: None,
             duration: gst::ClockTime::from_seconds(30),
         }
@@ -2232,6 +2242,7 @@ mod tests {
             levels: AudioLevels::default(),
             title: "Passenger".into(),
             title_token: String::new(),
+            title_url: String::new(),
             subtitles: None,
             duration: gst::ClockTime::from_seconds(30),
         };
