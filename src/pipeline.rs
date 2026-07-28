@@ -2,7 +2,6 @@ use gst::prelude::*;
 use gstreamer as gst;
 use std::{
     collections::VecDeque,
-    env,
     error::Error,
     sync::{Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
@@ -2099,6 +2098,8 @@ mod tests {
             title: None,
             stream_key: String::new(),
             title_token: String::new(),
+            rtmp_url: String::new(),
+            title_url: String::new(),
         };
         let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
         let playback = PlaybackPipeline::build(&config).unwrap();
