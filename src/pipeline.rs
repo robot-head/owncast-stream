@@ -1,8 +1,10 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use std::{
+    collections::VecDeque,
     error::Error,
     sync::{Arc, Mutex, OnceLock},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -17,6 +19,245 @@ const INTER_CHANNEL: &str = "owncast-movie";
 const DEFAULT_GAIN_DB: f64 = 3.0;
 const MIN_GAIN_DB: f64 = -12.0;
 const MAX_GAIN_DB: f64 = 12.0;
+
+const AUDIO_RATE: u64 = 48_000;
+const AUDIO_BYTES_PER_FRAME: u64 = 8; // F32LE, two channels
+const AUDIO_CAPS: &str = "audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved";
+
+/// One tick of the bridge. Small enough that a starved tick is a short gap,
+/// large enough that the reader thread is not woken excessively.
+const BRIDGE_PERIOD: Duration = Duration::from_millis(20);
+/// How much decoded audio the bridge holds back before it starts emitting. The
+/// playback and broadcast pipelines run on independent schedules, so the reader
+/// needs slack to absorb jitter instead of fabricating silence on every tick.
+const BRIDGE_TARGET_FILL: Duration = Duration::from_millis(200);
+/// Upper bound on buffered audio. Reaching it stops draining the sink, which
+/// back-pressures the decoder rather than growing latency without limit.
+const BRIDGE_MAX_FILL: Duration = Duration::from_millis(500);
+/// How far the backlog may exceed [`BRIDGE_TARGET_FILL`] before the bridge
+/// drops the oldest audio. Every inserted silence delays everything behind it,
+/// so without this the media timeline slips further from video on each gap.
+/// Well above a single period, so ordinary jitter never trips it.
+const BRIDGE_MAX_DRIFT: Duration = Duration::from_millis(100);
+/// A tick this far behind the clock means the thread lost the CPU for long
+/// enough that catching up sample-by-sample would be worse than resyncing.
+const BRIDGE_RESYNC_SLIP: Duration = Duration::from_secs(1);
+
+fn audio_bytes(span: Duration) -> usize {
+    let frames = span.as_nanos() as u64 * AUDIO_RATE / 1_000_000_000;
+    (frames * AUDIO_BYTES_PER_FRAME) as usize
+}
+
+#[derive(Default)]
+struct BridgeState {
+    buffered: VecDeque<u8>,
+    /// Withhold decoded audio until [`BRIDGE_TARGET_FILL`] is buffered.
+    priming: bool,
+    /// Playback is paused. The broadcast is on the lobby pad, so anything the
+    /// bridge emits is discarded; consuming the backlog would silently skip
+    /// that audio and leave the movie out of sync once playback resumes.
+    paused: bool,
+    flush: bool,
+    stopped: bool,
+}
+
+struct BridgeLimits {
+    period_bytes: usize,
+    target_bytes: usize,
+    max_bytes: usize,
+    drift_bytes: usize,
+}
+
+impl BridgeState {
+    /// Apply a pending flush, dropping audio a seek has made stale.
+    fn take_flush(&mut self) {
+        if std::mem::take(&mut self.flush) {
+            self.buffered.clear();
+            self.priming = true;
+        }
+    }
+}
+
+/// Decide what the next tick emits. While priming, the bridge holds back audio
+/// until `target_bytes` is buffered; once running, a tick that cannot be filled
+/// emits silence and returns to priming, so one hiccup costs a single gap
+/// rather than a run of them.
+fn next_payload(state: &mut BridgeState, limits: &BridgeLimits) -> Vec<u8> {
+    let silence = || vec![0; limits.period_bytes];
+    // Paused playback broadcasts lobby silence, so hold the backlog untouched
+    // for the resume rather than draining it into a discarded pad.
+    if state.paused {
+        return silence();
+    }
+    if state.priming {
+        if state.buffered.len() < limits.target_bytes {
+            return silence();
+        }
+        state.priming = false;
+    }
+    if state.buffered.len() < limits.period_bytes {
+        return silence();
+    }
+    // Drop audio that inserted silence has pushed too far behind the media
+    // timeline instead of carrying the delay forward for the rest of the movie.
+    if state.buffered.len() > limits.target_bytes + limits.drift_bytes {
+        let excess = state.buffered.len() - limits.target_bytes;
+        state.buffered.drain(..excess);
+    }
+    state.buffered.drain(..limits.period_bytes).collect()
+}
+
+/// Carries decoded movie audio from the playback pipeline's `appsink` to the
+/// broadcast pipeline's `appsrc`, pacing it against the broadcast clock.
+///
+/// The two pipelines are independent, so this replaces the `interaudiosink` /
+/// `interaudiosrc` pair, whose fixed read period underran constantly and padded
+/// each shortfall with silence.
+struct AudioBridge {
+    state: Arc<Mutex<BridgeState>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl AudioBridge {
+    fn start(
+        sink: gst::Element,
+        source: gst::Element,
+        broadcast: gst::Pipeline,
+    ) -> Result<Self, Box<dyn Error>> {
+        let state = Arc::new(Mutex::new(BridgeState {
+            priming: true,
+            ..BridgeState::default()
+        }));
+        let reader_state = state.clone();
+        // Without this thread the movie audio pad has no producer at all, so a
+        // failed spawn has to fail the session rather than stream silence.
+        let reader = thread::Builder::new()
+            .name("audio-bridge".into())
+            .spawn(move || run_audio_bridge(&sink, &source, &broadcast, &reader_state))
+            .map_err(|failure| error(format!("Cannot start the audio bridge: {failure}")))?;
+        Ok(Self {
+            state,
+            reader: Some(reader),
+        })
+    }
+
+    /// Drop buffered audio that a flushing seek has made stale.
+    fn flush(&self) {
+        self.state.lock().unwrap().flush = true;
+    }
+
+    /// Hold or release the backlog across a playback pause.
+    fn set_paused(&self, paused: bool) {
+        self.state.lock().unwrap().paused = paused;
+    }
+
+    /// A bridge with no reader thread, for tests that assemble a session by
+    /// hand and never move audio through it.
+    #[cfg(test)]
+    fn idle() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BridgeState::default())),
+            reader: None,
+        }
+    }
+}
+
+impl Drop for AudioBridge {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().stopped = true;
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+/// Move every sample the sink has ready into the jitter buffer. Stopping at
+/// [`BRIDGE_MAX_FILL`] leaves the rest queued in the sink, which back-pressures
+/// the decoder.
+fn drain_audio_sink(sink: &gst::Element, buffered: &mut VecDeque<u8>, max_bytes: usize) {
+    while buffered.len() < max_bytes {
+        let Some(sample) =
+            sink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&gst::ClockTime::ZERO])
+        else {
+            return;
+        };
+        let Some(buffer) = sample.buffer() else {
+            continue;
+        };
+        if let Ok(map) = buffer.map_readable() {
+            buffered.extend(map.as_slice());
+        }
+    }
+}
+
+fn run_audio_bridge(
+    sink: &gst::Element,
+    source: &gst::Element,
+    broadcast: &gst::Pipeline,
+    state: &Arc<Mutex<BridgeState>>,
+) {
+    let limits = BridgeLimits {
+        period_bytes: audio_bytes(BRIDGE_PERIOD),
+        target_bytes: audio_bytes(BRIDGE_TARGET_FILL),
+        max_bytes: audio_bytes(BRIDGE_MAX_FILL),
+        drift_bytes: audio_bytes(BRIDGE_MAX_DRIFT),
+    };
+    let period = gst::ClockTime::from_nseconds(BRIDGE_PERIOD.as_nanos() as u64);
+    let slip = gst::ClockTime::from_nseconds(BRIDGE_RESYNC_SLIP.as_nanos() as u64);
+    let mut next: Option<gst::ClockTime> = None;
+
+    loop {
+        if state.lock().unwrap().stopped {
+            return;
+        }
+        // The broadcast pipeline owns the timeline: buffers are stamped with,
+        // and released at, its running time, exactly as a live source would.
+        let (Some(clock), Some(base)) = (broadcast.clock(), broadcast.base_time()) else {
+            next = None;
+            thread::sleep(BRIDGE_PERIOD);
+            continue;
+        };
+        let Some(now) = clock.time().checked_sub(base) else {
+            next = None;
+            thread::sleep(BRIDGE_PERIOD);
+            continue;
+        };
+        let due = match next {
+            Some(due) if due + slip > now => due,
+            // First tick, or the thread slipped far enough that replaying the
+            // backlog would only push us further behind.
+            _ => now,
+        };
+        if let Some(id) = due
+            .checked_add(base)
+            .map(|deadline| clock.new_single_shot_id(deadline))
+        {
+            let _ = id.wait();
+        }
+        if state.lock().unwrap().stopped {
+            return;
+        }
+
+        let payload = {
+            let mut state = state.lock().unwrap();
+            state.take_flush();
+            drain_audio_sink(sink, &mut state.buffered, limits.max_bytes);
+            next_payload(&mut state, &limits)
+        };
+
+        let mut buffer = gst::Buffer::from_mut_slice(payload);
+        {
+            let buffer = buffer.get_mut().expect("fresh buffer is writable");
+            buffer.set_pts(due);
+            buffer.set_duration(period);
+        }
+        // A rejected push means the broadcast pipeline is flushing or shutting
+        // down. Keep to the schedule and retry rather than killing audio for
+        // the rest of the session; the loop only exits when it is stopped.
+        let _ = source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&buffer]);
+        next = due.checked_add(period);
+    }
+}
 
 fn db_to_amplitude(db: f64) -> f64 {
     10.0_f64.powf(db / 20.0)
@@ -53,9 +294,8 @@ const REQUIRED_ELEMENTS: &[&str] = &[
     "input-selector",
     "intervideosink",
     "intervideosrc",
-    "interaudiosink",
-    "interaudiosrc",
     "appsrc",
+    "appsink",
     "imagefreeze",
     "videoconvert",
     "aspectratiocrop",
@@ -180,6 +420,7 @@ struct BroadcastPipeline {
     video_selector: gst::Element,
     audio_selector: gst::Element,
     audio_gain: gst::Element,
+    audio_source: gst::Element,
     freeze_bin: gst::Bin,
     freeze_source: gst::Element,
     audio_lobby_pad: gst::Pad,
@@ -233,8 +474,9 @@ impl BroadcastPipeline {
               ! queue max-size-buffers=8 leaky=downstream
               ! audio_selector.sink_0
 
-            interaudiosrc name=movie_audio_source channel={INTER_CHANNEL}
-              ! queue max-size-buffers=8 leaky=downstream
+            appsrc name=movie_audio_source is-live=true format=time
+                do-timestamp=false block=false caps="{AUDIO_CAPS}"
+              ! queue max-size-buffers=8
               ! audio_selector.sink_1
 
             input-selector name=audio_selector sync-streams=true
@@ -269,6 +511,13 @@ impl BroadcastPipeline {
             .by_name("audio_gain")
             .ok_or_else(|| error("Audio gain is missing"))?;
         audio_gain.set_property("volume", db_to_amplitude(DEFAULT_GAIN_DB));
+        let audio_source = pipeline
+            .by_name("movie_audio_source")
+            .ok_or_else(|| error("Movie audio source is missing"))?;
+        audio_source.set_property(
+            "min-latency",
+            i64::try_from(BRIDGE_PERIOD.as_nanos()).unwrap_or(i64::MAX),
+        );
         let video_lobby_pad = video_selector
             .static_pad("sink_0")
             .ok_or_else(|| error("Video lobby pad is missing"))?;
@@ -310,6 +559,7 @@ impl BroadcastPipeline {
             video_selector,
             audio_selector,
             audio_gain,
+            audio_source,
             freeze_bin,
             freeze_source,
             audio_lobby_pad,
@@ -460,6 +710,7 @@ fn watch_movie_pad(
 struct PlaybackPipeline {
     pipeline: gst::Pipeline,
     movie: gst::Element,
+    audio_output: gst::Element,
     subtitle_overlay: gst::Element,
     sinks: SelectedSinks,
     selection: Arc<OnceLock<Selection>>,
@@ -502,11 +753,23 @@ impl PlaybackPipeline {
         let audio_bin = gst::parse::bin_from_description_with_name(
             &format!(
                 "queue name=movie_audio_input max-size-buffers=8 \
-                 ! interaudiosink name=movie_audio_output channel={INTER_CHANNEL} sync=true"
+                 ! audioconvert ! audioresample ! {AUDIO_CAPS} \
+                 ! appsink name=movie_audio_output sync=true max-buffers=64 drop=false"
             ),
             false,
             "movie_audio",
         )?;
+        let audio_output = audio_bin
+            .by_name("movie_audio_output")
+            .ok_or_else(|| error("Movie audio output is missing"))?;
+        // Releasing on the media timeline is what keeps audio aligned with
+        // video: a track that starts late stays late, and a gap stays a gap.
+        // The offset hands each buffer over exactly one target fill early, so
+        // the bridge gets its slack without the timeline drifting.
+        audio_output.set_property(
+            "ts-offset",
+            -i64::try_from(BRIDGE_TARGET_FILL.as_nanos()).unwrap_or(i64::MAX),
+        );
         let subtitle_overlay = video_bin
             .by_name("movie_subtitles")
             .ok_or_else(|| error("Subtitle overlay is missing"))?;
@@ -562,6 +825,7 @@ impl PlaybackPipeline {
         Ok(Self {
             pipeline,
             movie,
+            audio_output,
             subtitle_overlay,
             sinks,
             selection,
@@ -790,6 +1054,9 @@ pub(crate) enum SessionEvent {
 }
 
 pub(crate) struct StreamSession {
+    // Declared first so its reader thread is joined before either pipeline is
+    // torn down.
+    audio_bridge: AudioBridge,
     broadcast: BroadcastPipeline,
     playback: PlaybackPipeline,
     state: PlaybackState,
@@ -832,7 +1099,13 @@ impl StreamSession {
         )?;
         broadcast.pipeline.set_state(gst::State::Playing)?;
         playback.pipeline.set_state(gst::State::Paused)?;
+        let audio_bridge = AudioBridge::start(
+            playback.audio_output.clone(),
+            broadcast.audio_source.clone(),
+            broadcast.pipeline.clone(),
+        )?;
         Ok(Self {
+            audio_bridge,
             broadcast,
             playback,
             state: PlaybackState::Lobby,
@@ -898,15 +1171,27 @@ impl StreamSession {
             .unwrap_or(gst::ClockTime::ZERO)
     }
 
+    fn pause_playback(&self) -> Result<(), Box<dyn Error>> {
+        self.broadcast.freeze(self.playback.latest_frame()?)?;
+        self.playback.pipeline.set_state(gst::State::Paused)?;
+        Ok(())
+    }
+
     pub(crate) fn toggle_pause(&mut self) -> Result<(), Box<dyn Error>> {
         match self.state {
             PlaybackState::Playing => {
-                self.broadcast.freeze(self.playback.latest_frame()?)?;
-                self.playback.pipeline.set_state(gst::State::Paused)?;
+                // Hold the backlog before the broadcast leaves the movie pad,
+                // so no buffered audio is consumed into the discarded output.
+                self.audio_bridge.set_paused(true);
+                if let Err(failure) = self.pause_playback() {
+                    self.audio_bridge.set_paused(false);
+                    return Err(failure);
+                }
                 self.state = PlaybackState::Paused;
             }
             PlaybackState::Paused => {
                 self.playback.pipeline.set_state(gst::State::Playing)?;
+                self.audio_bridge.set_paused(false);
                 self.broadcast.select_movie();
                 self.state = PlaybackState::Playing;
             }
@@ -922,9 +1207,17 @@ impl StreamSession {
         let target = seek_target(self.position(), self.duration, seconds);
         let keep_last_frame = self.state == PlaybackState::Paused && target == self.duration;
         let generation = self.playback.frame_generation();
-        self.playback
+        // Audio buffered from before the seek belongs to the old position.
+        // Flush ahead of the seek so none of it is broadcast while the playback
+        // pipeline settles, and again afterwards to drop whatever the sink
+        // handed over mid-seek.
+        self.audio_bridge.flush();
+        let seek = self
+            .playback
             .pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target)?;
+            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target);
+        self.audio_bridge.flush();
+        seek?;
         if self.state == PlaybackState::Paused {
             let state_change = self
                 .playback
@@ -1049,10 +1342,12 @@ mod tests {
         let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
         pipeline.add_many([&movie, &subtitle_overlay]).unwrap();
         StreamSession {
+            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
             playback: PlaybackPipeline {
                 pipeline,
                 movie,
+                audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
                 subtitle_overlay,
                 sinks: SelectedSinks {
                     video: gst::Pad::new(gst::PadDirection::Sink),
@@ -1095,6 +1390,7 @@ mod tests {
             PlaybackPipeline {
                 pipeline,
                 movie,
+                audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
                 subtitle_overlay,
                 sinks: SelectedSinks {
                     video: gst::Pad::new(gst::PadDirection::Sink),
@@ -1138,10 +1434,12 @@ mod tests {
         let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
         let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
         StreamSession {
+            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
             playback: PlaybackPipeline {
                 pipeline,
                 movie,
+                audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
                 subtitle_overlay,
                 sinks: SelectedSinks {
                     video: gst::Pad::new(gst::PadDirection::Sink),
@@ -1638,8 +1936,6 @@ mod tests {
               ! videoconvert
               ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1
               ! intervideosink channel={INTER_CHANNEL} sync=true
-            audiotestsrc is-live=true wave=sine
-              ! interaudiosink channel={INTER_CHANNEL} sync=true
             "#
         ))
         .unwrap()
@@ -1718,6 +2014,373 @@ mod tests {
 
         assert!(frames.load(Ordering::Relaxed) >= 3);
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    fn bridge_state(buffered: usize, priming: bool) -> BridgeState {
+        BridgeState {
+            buffered: std::iter::repeat_n(0x7f, buffered).collect(),
+            priming,
+            ..BridgeState::default()
+        }
+    }
+
+    fn bridge_limits() -> BridgeLimits {
+        BridgeLimits {
+            period_bytes: 40,
+            target_bytes: 160,
+            max_bytes: 400,
+            drift_bytes: 80,
+        }
+    }
+
+    #[test]
+    fn priming_bridge_emits_silence_until_the_target_fill_is_buffered() {
+        let mut state = bridge_state(80, true);
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0; 40]);
+        assert!(state.priming, "bridge left priming below the target fill");
+        assert_eq!(state.buffered.len(), 80, "silence consumed buffered audio");
+    }
+
+    #[test]
+    fn primed_bridge_emits_buffered_audio_once_the_target_fill_is_reached() {
+        let mut state = bridge_state(160, true);
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+        assert!(!state.priming);
+        assert_eq!(state.buffered.len(), 120);
+        // Still running, so a period is now enough to keep emitting audio.
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+        assert!(!state.priming);
+    }
+
+    #[test]
+    fn starved_bridge_emits_silence_without_consuming_the_backlog() {
+        let mut state = bridge_state(20, false);
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0; 40]);
+        assert_eq!(state.buffered.len(), 20, "silence consumed buffered audio");
+
+        // The sink refills on the media timeline, so a period is enough to
+        // resume; priming is only for startup and flushes.
+        state.buffered.extend([0x7f; 40]);
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+    }
+
+    #[test]
+    fn paused_bridge_holds_the_backlog_for_the_resume() {
+        let mut state = bridge_state(200, false);
+        state.paused = true;
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0; 40]);
+        assert_eq!(
+            state.buffered.len(),
+            200,
+            "paused bridge consumed audio into the discarded pad"
+        );
+
+        state.paused = false;
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+        assert!(!state.priming, "resume should not re-prime a full backlog");
+    }
+
+    #[test]
+    fn backlog_beyond_the_drift_allowance_is_dropped_to_the_target() {
+        // Repeated silence has pushed the backlog past target + drift.
+        let mut state = bridge_state(300, false);
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+
+        // Trimmed to the target, then a period taken from it.
+        assert_eq!(state.buffered.len(), 120);
+    }
+
+    #[test]
+    fn backlog_within_the_drift_allowance_is_left_alone() {
+        let mut state = bridge_state(240, false);
+
+        assert_eq!(next_payload(&mut state, &bridge_limits()), vec![0x7f; 40]);
+
+        assert_eq!(state.buffered.len(), 200, "ordinary jitter was trimmed");
+    }
+
+    #[test]
+    fn flush_drops_buffered_audio_and_reprimes() {
+        let mut state = bridge_state(200, false);
+        state.flush = true;
+
+        state.take_flush();
+
+        assert!(state.buffered.is_empty(), "stale audio survived the flush");
+        assert!(state.priming, "flushed bridge did not return to priming");
+        assert!(!state.flush, "flush request was not consumed");
+    }
+
+    #[test]
+    fn pausing_holds_buffered_audio_and_resuming_releases_it() {
+        let _gst = gst_test();
+        let mut session = session_with_test_video(0);
+        session
+            .broadcast
+            .pipeline
+            .set_state(gst::State::Playing)
+            .unwrap();
+        session.start_transition(Duration::from_secs(1)).unwrap();
+
+        session.toggle_pause().unwrap();
+
+        assert_eq!(session.state(), PlaybackState::Paused);
+        assert!(
+            session.audio_bridge.state.lock().unwrap().paused,
+            "paused playback kept draining the audio backlog"
+        );
+
+        session.toggle_pause().unwrap();
+
+        assert_eq!(session.state(), PlaybackState::Playing);
+        assert!(!session.audio_bridge.state.lock().unwrap().paused);
+    }
+
+    #[test]
+    fn seek_flushes_audio_buffered_before_the_new_position() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+        session.state = PlaybackState::Playing;
+        session
+            .audio_bridge
+            .state
+            .lock()
+            .unwrap()
+            .buffered
+            .extend([0x7f; 64]);
+
+        session.seek_by(-5).unwrap();
+
+        assert!(session.audio_bridge.state.lock().unwrap().flush);
+    }
+
+    #[test]
+    fn audio_bridge_delivers_decoded_audio_after_priming() {
+        let _gst = gst_test();
+        let broadcast = gst::parse::launch(&format!(
+            r#"
+            appsrc name=movie_audio_source is-live=true format=time
+                do-timestamp=false block=false caps="{AUDIO_CAPS}"
+              ! fakesink name=sink sync=true
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let playback = gst::parse::launch(&format!(
+            r#"
+            audiotestsrc wave=sine freq=1000 volume=0.8
+              ! audioconvert ! audioresample ! {AUDIO_CAPS}
+              ! appsink name=movie_audio_output sync=false max-buffers=64 drop=false
+            "#
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let loud = Arc::new(AtomicU64::new(0));
+        let counted = loud.clone();
+        broadcast
+            .by_name("sink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(buffer) = info.buffer()
+                    && let Ok(map) = buffer.map_readable()
+                    && map.chunks_exact(4).any(|sample| {
+                        f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs() > 0.1
+                    })
+                {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        broadcast.set_state(gst::State::Playing).unwrap();
+        playback.set_state(gst::State::Playing).unwrap();
+        let bridge = AudioBridge::start(
+            playback.by_name("movie_audio_output").unwrap(),
+            broadcast.by_name("movie_audio_source").unwrap(),
+            broadcast.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        let delivered = loud.load(Ordering::Relaxed);
+        drop(bridge);
+        playback.set_state(gst::State::Null).unwrap();
+        broadcast.set_state(gst::State::Null).unwrap();
+
+        assert!(
+            delivered >= 10,
+            "bridge delivered only {delivered} audio buffers"
+        );
+    }
+
+    /// Records the broadcast's own timeline for both streams: one CSV row per
+    /// buffer leaving the video selector and the audio gain, tagged with the
+    /// running time it carries. A source whose video flashes and audio beeps
+    /// share an edge then shows any A/V offset as the gap between those edges.
+    #[test]
+    #[ignore = "manual probe: PROBE_VIDEO=flashes.mkv PROBE_OUT=out.csv cargo test -- --ignored"]
+    fn av_sync_probe() {
+        let _gst = gst_test();
+        let config = Config {
+            video: std::env::var("PROBE_VIDEO").unwrap().into(),
+            subtitles: None,
+            title: None,
+            stream_key: String::new(),
+            title_token: String::new(),
+            rtmp_url: String::new(),
+            title_url: String::new(),
+        };
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        let playback = PlaybackPipeline::build(&config).unwrap();
+        let log = Arc::new(Mutex::new(
+            std::fs::File::create(std::env::var("PROBE_OUT").unwrap()).unwrap(),
+        ));
+
+        let video_log = log.clone();
+        broadcast
+            .video_selector
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                use std::io::Write;
+                if let Some(buffer) = info.buffer()
+                    && let Some(pts) = buffer.pts()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    // Whole frames are flat black or white, so a corner of the
+                    // luma plane is enough to classify one.
+                    let corner = &map.as_slice()[..4096.min(map.size())];
+                    let luma = corner.iter().map(|&value| u32::from(value)).sum::<u32>()
+                        / corner.len() as u32;
+                    writeln!(video_log.lock().unwrap(), "v,{},{luma}", pts.nseconds()).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        let audio_log = log.clone();
+        broadcast
+            .audio_gain
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                use std::io::Write;
+                if let Some(buffer) = info.buffer()
+                    && let Some(pts) = buffer.pts()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    let peak = map
+                        .as_slice()
+                        .chunks_exact(4)
+                        .map(|sample| {
+                            f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).abs()
+                        })
+                        .fold(0.0_f32, f32::max);
+                    writeln!(audio_log.lock().unwrap(), "a,{},{peak:.4}", pts.nseconds()).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        broadcast.pipeline.set_state(gst::State::Playing).unwrap();
+        playback.pipeline.set_state(gst::State::Paused).unwrap();
+        let bridge = AudioBridge::start(
+            playback.audio_output.clone(),
+            broadcast.audio_source.clone(),
+            broadcast.pipeline.clone(),
+        )
+        .unwrap();
+        playback.wait_ready(None).unwrap();
+        playback.pipeline.set_state(gst::State::Playing).unwrap();
+        playback
+            .wait_for_frame_after(0, Duration::from_secs(5))
+            .unwrap();
+        broadcast.select_movie();
+
+        let seconds = std::env::var("PROBE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30);
+        // Optionally exercise a pause partway through, which is where holding
+        // the backlog matters.
+        if let Ok(at) = std::env::var("PROBE_PAUSE_AT")
+            && let Ok(at) = at.parse::<u64>()
+        {
+            std::thread::sleep(Duration::from_secs(at));
+            bridge.set_paused(true);
+            broadcast.freeze(playback.latest_frame().unwrap()).unwrap();
+            playback.pipeline.set_state(gst::State::Paused).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            playback.pipeline.set_state(gst::State::Playing).unwrap();
+            bridge.set_paused(false);
+            broadcast.select_movie();
+            std::thread::sleep(Duration::from_secs(seconds - at));
+        } else {
+            std::thread::sleep(Duration::from_secs(seconds));
+        }
+        drop(bridge);
+    }
+
+    #[test]
+    #[ignore = "manual probe: PROBE_VIDEO=in.mkv PROBE_OUT=out.f32 cargo test -- --ignored"]
+    fn audio_bridge_continuity_probe() {
+        let _gst = gst_test();
+        let config = Config {
+            video: std::env::var("PROBE_VIDEO").unwrap().into(),
+            subtitles: None,
+            title: None,
+            stream_key: String::new(),
+            title_token: String::new(),
+            rtmp_url: String::new(),
+            title_url: String::new(),
+        };
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        let playback = PlaybackPipeline::build(&config).unwrap();
+        let capture = Arc::new(Mutex::new(
+            std::fs::File::create(std::env::var("PROBE_OUT").unwrap()).unwrap(),
+        ));
+        broadcast
+            .audio_gain
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                use std::io::Write;
+                if let Some(buffer) = info.buffer()
+                    && let Ok(map) = buffer.map_readable()
+                {
+                    capture.lock().unwrap().write_all(map.as_slice()).unwrap();
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        broadcast.pipeline.set_state(gst::State::Playing).unwrap();
+        playback.pipeline.set_state(gst::State::Paused).unwrap();
+        let bridge = AudioBridge::start(
+            playback.audio_output.clone(),
+            broadcast.audio_source.clone(),
+            broadcast.pipeline.clone(),
+        );
+        playback.wait_ready(None).unwrap();
+        playback.pipeline.set_state(gst::State::Playing).unwrap();
+        playback
+            .wait_for_frame_after(0, Duration::from_secs(5))
+            .unwrap();
+        broadcast.select_movie();
+        let seconds = std::env::var("PROBE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(25);
+        std::thread::sleep(Duration::from_secs(seconds));
+        drop(bridge);
     }
 
     #[test]
@@ -1801,6 +2464,7 @@ mod tests {
         let playback = PlaybackPipeline {
             pipeline: playback_pipeline,
             movie,
+            audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
             subtitle_overlay,
             sinks: SelectedSinks {
                 video: gst::Pad::new(gst::PadDirection::Sink),
@@ -1812,6 +2476,7 @@ mod tests {
             latest_frame: Arc::new(Mutex::new(None)),
         };
         let mut session = StreamSession {
+            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
             playback,
             state: PlaybackState::Playing,
