@@ -42,8 +42,25 @@ sudo install -m 0755 target/release/owncast-stream /usr/local/bin/owncast-stream
 ## Usage
 
 ```bash
-owncast-stream VIDEO [SUBTITLES] [TITLE]
+owncast-stream [OPTIONS] VIDEO [SUBTITLES] [TITLE]
 ```
+
+By default, the streamer publishes to the local Owncast instance and reads its
+credentials from the files listed above. To publish to a remote instance,
+provide its RTMP publish URL, stream-title integration endpoint, and credentials:
+
+```bash
+owncast-stream \
+  --rtmp-url rtmp://owncast.example/live \
+  --api-url https://owncast.example/api/integrations/streamtitle \
+  --stream-key "$STREAM_KEY" \
+  --api-key "$TITLE_TOKEN" \
+  movie.mkv
+```
+
+The RTMP URL should omit the stream key; `owncast-stream` appends the value of
+`--stream-key`. All four options may also be used independently, so a remote
+server can still use credentials read from the default files.
 
 The external subtitle file is used only when the video has no non-SDH embedded
 English subtitle stream.

@@ -11,6 +11,14 @@ use std::{
 
 const STREAM_KEY_FILE: &str = "/opt/owncast/stream-key";
 const TITLE_TOKEN_FILE: &str = "/opt/owncast/title-token";
+const DEFAULT_RTMP_URL: &str = "rtmp://127.0.0.1/live";
+const DEFAULT_TITLE_URL: &str = "http://127.0.0.1:8081/api/integrations/streamtitle";
+const USAGE: &str = "Usage: owncast-stream [OPTIONS] VIDEO [SUBTITLES] [TITLE]\n\
+Options:\n\
+  --rtmp-url URL       RTMP publish URL without the stream key\n\
+  --api-url URL        Owncast stream-title integration endpoint\n\
+  --stream-key KEY     Stream key (defaults to /opt/owncast/stream-key)\n\
+  --api-key KEY        Integration token (defaults to /opt/owncast/title-token)";
 
 #[derive(Debug)]
 struct MessageError(String);
@@ -46,14 +54,45 @@ struct Config {
     title: Option<String>,
     stream_key: String,
     title_token: String,
+    rtmp_url: String,
+    title_url: String,
 }
 
 impl Config {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, Box<dyn Error>> {
         let _program = args.next();
-        let values: Vec<_> = args.collect();
+        let mut values = Vec::new();
+        let mut stream_key = None;
+        let mut title_token = None;
+        let mut rtmp_url = None;
+        let mut title_url = None;
+        let mut args = args.peekable();
+        while let Some(argument) = args.next() {
+            let destination = match argument.as_str() {
+                "--stream-key" => &mut stream_key,
+                "--api-key" | "--title-token" => &mut title_token,
+                "--rtmp-url" => &mut rtmp_url,
+                "--api-url" | "--title-url" => &mut title_url,
+                "--" => {
+                    values.extend(args);
+                    break;
+                }
+                value if value.starts_with('-') => {
+                    return Err(error(format!("Unknown option: {value}\n{USAGE}")));
+                }
+                _ => {
+                    values.push(argument);
+                    continue;
+                }
+            };
+            *destination = Some(
+                args.next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| error(format!("Missing value for {argument}\n{USAGE}")))?,
+            );
+        }
         if values.is_empty() || values.len() > 3 {
-            return Err(error("Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]"));
+            return Err(error(USAGE));
         }
 
         let cwd = env::current_dir()?;
@@ -73,8 +112,16 @@ impl Config {
             video,
             subtitles,
             title,
-            stream_key: read_secret(STREAM_KEY_FILE, "stream key")?,
-            title_token: read_secret(TITLE_TOKEN_FILE, "title token")?,
+            stream_key: match stream_key {
+                Some(value) => value.trim().to_owned(),
+                None => read_secret(STREAM_KEY_FILE, "stream key")?,
+            },
+            title_token: match title_token {
+                Some(value) => value.trim().to_owned(),
+                None => read_secret(TITLE_TOKEN_FILE, "title token")?,
+            },
+            rtmp_url: rtmp_url.unwrap_or_else(|| DEFAULT_RTMP_URL.to_owned()),
+            title_url: title_url.unwrap_or_else(|| DEFAULT_TITLE_URL.to_owned()),
         })
     }
 }
@@ -90,9 +137,7 @@ struct TitleBody<'a> {
     value: &'a str,
 }
 
-fn set_title(token: &str, title: &str) -> Result<(), Box<dyn Error>> {
-    let url = env::var("OWNCAST_TITLE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8081/api/integrations/streamtitle".into());
+fn set_title(url: &str, token: &str, title: &str) -> Result<(), Box<dyn Error>> {
     ureq::post(url)
         .header("Authorization", &format!("Bearer {token}"))
         .send_json(&TitleBody { value: title })?;
@@ -101,10 +146,6 @@ fn set_title(token: &str, title: &str) -> Result<(), Box<dyn Error>> {
 
 fn main() {
     let args: Vec<_> = env::args().collect();
-    if !(2..=4).contains(&args.len()) {
-        eprintln!("Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]");
-        std::process::exit(2);
-    }
     let result = Config::parse(args.into_iter()).and_then(|config| {
         let media = media::discover(&config.video, config.title.as_deref())?;
         let mut session = pipeline::StreamSession::new(&config, &media)?;
@@ -112,7 +153,11 @@ fn main() {
     });
     if let Err(failure) = result {
         eprintln!("{failure}");
-        std::process::exit(1);
+        std::process::exit(if failure.to_string().contains("Usage: owncast-stream") {
+            2
+        } else {
+            1
+        });
     }
 }
 
@@ -151,5 +196,35 @@ mod tests {
 
         assert_eq!(resolved, root.join("premiere.mkv"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_remote_owncast_options() {
+        let video = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let config = Config::parse(
+            [
+                "owncast-stream",
+                "--rtmp-url",
+                "rtmp://owncast.example/live/",
+                "--api-url",
+                "https://owncast.example/api/integrations/streamtitle",
+                "--stream-key",
+                "remote-key",
+                "--api-key",
+                "remote-token",
+                video.to_str().unwrap(),
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(config.rtmp_url, "rtmp://owncast.example/live/");
+        assert_eq!(
+            config.title_url,
+            "https://owncast.example/api/integrations/streamtitle"
+        );
+        assert_eq!(config.stream_key, "remote-key");
+        assert_eq!(config.title_token, "remote-token");
     }
 }

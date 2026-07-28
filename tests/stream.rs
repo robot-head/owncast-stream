@@ -8,7 +8,12 @@ fn usage_errors_exit_with_status_two() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "Usage: owncast-stream VIDEO [SUBTITLES] [TITLE]\n"
+        "Usage: owncast-stream [OPTIONS] VIDEO [SUBTITLES] [TITLE]\n\
+Options:\n\
+  --rtmp-url URL       RTMP publish URL without the stream key\n\
+  --api-url URL        Owncast stream-title integration endpoint\n\
+  --stream-key KEY     Stream key (defaults to /opt/owncast/stream-key)\n\
+  --api-key KEY        Integration token (defaults to /opt/owncast/title-token)\n"
     );
 }
 
