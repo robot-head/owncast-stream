@@ -15,10 +15,11 @@ const DEFAULT_RTMP_URL: &str = "rtmp://127.0.0.1/live";
 const DEFAULT_TITLE_URL: &str = "http://127.0.0.1:8081/api/integrations/streamtitle";
 const USAGE: &str = "Usage: owncast-stream [OPTIONS] VIDEO [SUBTITLES] [TITLE]\n\
 Options:\n\
-  --rtmp-url URL       RTMP publish URL without the stream key\n\
-  --api-url URL        Owncast stream-title integration endpoint\n\
-  --stream-key KEY     Stream key (defaults to /opt/owncast/stream-key)\n\
-  --api-key KEY        Integration token (defaults to /opt/owncast/title-token)";
+  --queue VIDEO       Append a video to the startup playlist (repeatable)\n\
+  --rtmp-url URL      RTMP publish URL without the stream key\n\
+  --api-url URL       Owncast stream-title integration endpoint\n\
+  --stream-key KEY    Stream key (defaults to /opt/owncast/stream-key)\n\
+  --api-key KEY       Integration token (defaults to /opt/owncast/title-token)";
 
 #[derive(Debug)]
 struct MessageError(String);
@@ -49,9 +50,11 @@ fn resolve_media_path(cwd: &Path, value: &str, name: &str) -> Result<PathBuf, Bo
 }
 
 struct Config {
+    startup_dir: PathBuf,
     video: PathBuf,
     subtitles: Option<PathBuf>,
     title: Option<String>,
+    queued_videos: Vec<PathBuf>,
     stream_key: String,
     title_token: String,
     rtmp_url: String,
@@ -66,8 +69,17 @@ impl Config {
         let mut title_token = None;
         let mut rtmp_url = None;
         let mut title_url = None;
+        let mut queued_values = Vec::new();
         let mut args = args.peekable();
         while let Some(argument) = args.next() {
+            if argument == "--queue" {
+                queued_values.push(
+                    args.next()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| error(format!("Missing value for {argument}\n{USAGE}")))?,
+                );
+                continue;
+            }
             let destination = match argument.as_str() {
                 "--stream-key" => &mut stream_key,
                 "--api-key" | "--title-token" => &mut title_token,
@@ -107,11 +119,17 @@ impl Config {
             .map(|title| title.trim())
             .filter(|title| !title.is_empty())
             .map(str::to_owned);
+        let queued_videos = queued_values
+            .iter()
+            .map(|value| resolve_media_path(&cwd, value, "queued video"))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            startup_dir: cwd,
             video,
             subtitles,
             title,
+            queued_videos,
             stream_key: match stream_key {
                 Some(value) => value.trim().to_owned(),
                 None => read_secret(STREAM_KEY_FILE, "stream key")?,
@@ -147,9 +165,18 @@ fn set_title(url: &str, token: &str, title: &str) -> Result<(), Box<dyn Error>> 
 fn main() {
     let args: Vec<_> = env::args().collect();
     let result = Config::parse(args.into_iter()).and_then(|config| {
-        let media = media::discover(&config.video, config.title.as_deref())?;
-        let mut session = pipeline::StreamSession::new(&config, &media)?;
-        ratatui::run(|terminal| ui::run(terminal, &mut session))
+        let first = media::discover(
+            &config.video,
+            config.subtitles.clone(),
+            config.title.as_deref(),
+        )?;
+        let mut entries = Vec::with_capacity(1 + config.queued_videos.len());
+        entries.push(first);
+        for path in &config.queued_videos {
+            entries.push(media::discover(path, None, None)?);
+        }
+        let mut session = pipeline::StreamSession::new(&config, entries)?;
+        ratatui::run(|terminal| ui::run(terminal, &mut session, &config.startup_dir))
     });
     if let Err(failure) = result {
         eprintln!("{failure}");
@@ -226,5 +253,42 @@ mod tests {
         );
         assert_eq!(config.stream_key, "remote-key");
         assert_eq!(config.title_token, "remote-token");
+    }
+
+    #[test]
+    fn parses_repeatable_queue_in_argument_order() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let first = root.join("Cargo.toml");
+        let second = root.join("README.md");
+        let third = root.join("Cargo.lock");
+        let config = Config::parse(
+            [
+                "owncast-stream",
+                "--stream-key",
+                "key",
+                "--api-key",
+                "token",
+                "--queue",
+                second.to_str().unwrap(),
+                "--queue",
+                third.to_str().unwrap(),
+                first.to_str().unwrap(),
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(config.video, first);
+        assert_eq!(config.queued_videos, vec![second, third]);
+    }
+
+    #[test]
+    fn queue_requires_a_nonempty_value() {
+        let failure = Config::parse(["owncast-stream", "--queue"].into_iter().map(str::to_owned))
+            .err()
+            .unwrap();
+
+        assert!(failure.to_string().contains("Missing value for --queue"));
     }
 }
