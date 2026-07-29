@@ -38,7 +38,10 @@ pub(crate) struct Selection {
     pub subtitle: SubtitleSource,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct MediaInfo {
+    pub(crate) path: PathBuf,
+    pub(crate) subtitles: Option<PathBuf>,
     pub(crate) title: String,
     pub(crate) duration: gst::ClockTime,
 }
@@ -84,24 +87,36 @@ fn validated_duration(
 
 pub(crate) fn discover(
     path: &Path,
+    subtitles: Option<PathBuf>,
     explicit_title: Option<&str>,
 ) -> Result<MediaInfo, Box<dyn Error>> {
-    gst::init()?;
-    let uri = gst::glib::filename_to_uri(path, None)?;
-    let info = Discoverer::new(gst::ClockTime::from_seconds(10))?.discover_uri(&uri)?;
-    let duration =
-        validated_duration(info.result(), info.is_seekable(), info.duration()).map_err(error)?;
-    let embedded = info
-        .stream_info()
-        .and_then(|stream| stream.tags())
-        .and_then(|tags| {
-            tags.get::<gst::tags::Title>()
-                .map(|title| title.get().to_owned())
-        });
+    let discover = || -> Result<MediaInfo, Box<dyn Error>> {
+        gst::init()?;
+        let uri = gst::glib::filename_to_uri(path, None)?;
+        let info = Discoverer::new(gst::ClockTime::from_seconds(10))?.discover_uri(&uri)?;
+        let duration = validated_duration(info.result(), info.is_seekable(), info.duration())
+            .map_err(error)?;
+        let embedded = info
+            .stream_info()
+            .and_then(|stream| stream.tags())
+            .and_then(|tags| {
+                tags.get::<gst::tags::Title>()
+                    .map(|title| title.get().to_owned())
+            });
 
-    Ok(MediaInfo {
-        title: resolve_title(explicit_title, embedded.as_deref(), path),
-        duration,
+        Ok(MediaInfo {
+            path: path.to_owned(),
+            subtitles,
+            title: resolve_title(explicit_title, embedded.as_deref(), path),
+            duration,
+        })
+    };
+
+    discover().map_err(|failure| {
+        error(format!(
+            "Cannot discover video {}: {failure}",
+            path.display()
+        ))
     })
 }
 
@@ -296,5 +311,14 @@ mod tests {
             validated_duration(DiscovererResult::Ok, true, Some(gst::ClockTime::ZERO)).is_err()
         );
         assert!(validated_duration(DiscovererResult::Ok, true, None).is_err());
+    }
+
+    #[test]
+    fn discovery_error_names_the_video_path() {
+        let path = Path::new("/definitely/missing/playlist-entry.mkv");
+
+        let failure = discover(path, None, None).err().unwrap();
+
+        assert!(failure.to_string().contains(&path.display().to_string()));
     }
 }

@@ -1,7 +1,7 @@
 # owncast-stream
 
 A small Rust/GStreamer streamer for Owncast. It keeps one RTMP connection open
-while switching from a generated lobby to one movie.
+while switching between a generated lobby and queued videos.
 
 ![TUI Demo](./docs/demo.gif)
 
@@ -11,7 +11,10 @@ while switching from a generated lobby to one movie.
 - AAC audio with an 80 Hz high-pass filter and dynamic compression
 - Preferred English audio
 - Embedded non-SDH English subtitles, with external subtitles used only as a fallback
-- Continuous lobby-to-movie handoff without reconnecting viewers
+- Continuous lobby and playlist handoffs without reconnecting viewers
+- Persistent editable playlist with automatic track advancement
+- Repeatable startup queue entries and an in-terminal file chooser
+- Previous and next track controls
 - Pause with a frozen movie frame and silence while the RTMP stream stays live
 - 30-second forward and backward seeking
 - Amber projection-console TUI with playback status, gain, and stereo peak meters
@@ -43,6 +46,7 @@ sudo install -m 0755 target/release/owncast-stream /usr/local/bin/owncast-stream
 
 ```bash
 owncast-stream [OPTIONS] VIDEO [SUBTITLES] [TITLE]
+owncast-stream movie-one.mkv --queue movie-two.mkv --queue movie-three.mkv
 ```
 
 By default, the streamer publishes to the local Owncast instance and reads its
@@ -67,11 +71,20 @@ English subtitle stream.
 
 Controls:
 
-- Enter starts the movie from the lobby.
+- Enter starts the first pending track from the lobby.
 - Space pauses or resumes playback.
 - Left and Right seek backward or forward 30 seconds.
 - Up and Down adjust gain by 1 dB from -12 dB to +12 dB.
+- `p` and `n` restart the previous or next track.
+- `a` opens the file chooser; use Up/Down, Enter, Backspace, and Esc to browse.
+- Tab focuses playlist editing. Shift+Up/Down moves an unlocked entry, and
+  Delete or `d` removes it.
 - `q` or Ctrl-C quits.
+
+The playing row is locked while other entries can be reordered or removed.
+Tracks advance automatically. When the last track ends, the streamer returns
+to the lobby and keeps the Owncast connection and TUI alive; adding another
+video makes it available to start from the lobby.
 
 The stereo VU meter shows the post-gain signal from -60 dB to 0 dB. Peak
 markers hold for 3 seconds, then decay at 12 dB per second.

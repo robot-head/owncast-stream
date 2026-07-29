@@ -423,6 +423,7 @@ struct BroadcastPipeline {
     audio_source: gst::Element,
     freeze_bin: gst::Bin,
     freeze_source: gst::Element,
+    video_lobby_pad: gst::Pad,
     audio_lobby_pad: gst::Pad,
     video_movie_pad: gst::Pad,
     audio_movie_pad: gst::Pad,
@@ -562,6 +563,7 @@ impl BroadcastPipeline {
             audio_source,
             freeze_bin,
             freeze_source,
+            video_lobby_pad,
             audio_lobby_pad,
             video_movie_pad,
             audio_movie_pad,
@@ -574,6 +576,13 @@ impl BroadcastPipeline {
             .set_property("active-pad", Some(&self.video_movie_pad));
         self.audio_selector
             .set_property("active-pad", Some(&self.audio_movie_pad));
+    }
+
+    fn select_lobby(&self) {
+        self.video_selector
+            .set_property("active-pad", Some(&self.video_lobby_pad));
+        self.audio_selector
+            .set_property("active-pad", Some(&self.audio_lobby_pad));
     }
 
     fn freeze(&self, mut frame: gst::Buffer) -> Result<(), Box<dyn Error>> {
@@ -724,12 +733,12 @@ struct CapturedFrame {
 }
 
 impl PlaybackPipeline {
-    fn build(config: &Config) -> Result<Self, Box<dyn Error>> {
+    fn build(entry: &MediaInfo) -> Result<Self, Box<dyn Error>> {
         preflight()?;
         let pipeline = gst::Pipeline::new();
         let movie = gst::ElementFactory::make("uridecodebin3")
             .name("movie")
-            .property("uri", gst::glib::filename_to_uri(&config.video, None)?)
+            .property("uri", gst::glib::filename_to_uri(&entry.path, None)?)
             .build()?;
         let video_bin = gst::parse::bin_from_description_with_name(
             &format!(
@@ -1048,25 +1057,123 @@ impl Drop for PlaybackPipeline {
     }
 }
 
-pub(crate) enum SessionEvent {
-    Running,
-    Finished,
+struct Playlist {
+    entries: Vec<MediaInfo>,
+    active: Option<usize>,
+    selected: usize,
+    next_index: usize,
+}
+
+impl Playlist {
+    fn new(entries: Vec<MediaInfo>) -> Self {
+        Self {
+            entries,
+            active: None,
+            selected: 0,
+            next_index: 0,
+        }
+    }
+
+    fn start_target(&self) -> Option<usize> {
+        (self.next_index < self.entries.len()).then_some(self.next_index)
+    }
+
+    fn previous_target(&self) -> Option<usize> {
+        self.active.unwrap_or(self.next_index).checked_sub(1)
+    }
+
+    fn next_target(&self) -> Option<usize> {
+        let index = self.active.map_or(self.next_index, |index| index + 1);
+        (index < self.entries.len()).then_some(index)
+    }
+
+    fn activate(&mut self, index: usize) {
+        self.active = Some(index);
+        self.selected = index;
+        self.next_index = index + 1;
+    }
+
+    fn finish_target(&mut self) -> Option<usize> {
+        self.active = None;
+        self.start_target()
+    }
+
+    fn select_by(&mut self, delta: i32) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.selected
+                .saturating_add(delta as usize)
+                .min(self.entries.len() - 1)
+        };
+    }
+
+    fn move_selected(&mut self, delta: i32) -> bool {
+        let target = if delta < 0 {
+            self.selected.checked_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.selected.checked_add(delta as usize)
+        };
+        let Some(target) = target.filter(|target| *target < self.entries.len()) else {
+            return false;
+        };
+        let crosses = |boundary: usize| {
+            (self.selected < boundary && target >= boundary)
+                || (target < boundary && self.selected >= boundary)
+        };
+        if let Some(active) = self.active {
+            if self.selected == active || target == active || crosses(active) {
+                return false;
+            }
+        } else if crosses(self.next_index) {
+            return false;
+        }
+        self.entries.swap(self.selected, target);
+        self.selected = target;
+        true
+    }
+
+    fn remove_selected(&mut self) -> bool {
+        if self.entries.is_empty() || self.active == Some(self.selected) {
+            return false;
+        }
+        let removed = self.selected;
+        self.entries.remove(removed);
+        if self.active.is_some_and(|active| removed < active) {
+            self.active = self.active.map(|active| active - 1);
+        }
+        if removed < self.next_index {
+            self.next_index -= 1;
+        }
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        true
+    }
+
+    fn push(&mut self, entry: MediaInfo) {
+        self.entries.push(entry);
+        self.selected = self.entries.len() - 1;
+    }
+}
+
+struct ActivePlayback {
+    // Declared first so its reader thread is joined before playback is torn
+    // down.
+    audio_bridge: AudioBridge,
+    playback: PlaybackPipeline,
 }
 
 pub(crate) struct StreamSession {
-    // Declared first so its reader thread is joined before either pipeline is
-    // torn down.
-    audio_bridge: AudioBridge,
     broadcast: BroadcastPipeline,
-    playback: PlaybackPipeline,
+    active: Option<ActivePlayback>,
+    playlist: Playlist,
     state: PlaybackState,
     gain_db: f64,
     levels: AudioLevels,
-    title: String,
     title_token: String,
     title_url: String,
-    subtitles: Option<std::path::PathBuf>,
-    duration: gst::ClockTime,
 }
 
 fn seek_target(
@@ -1084,38 +1191,31 @@ fn seek_target(
 }
 
 impl StreamSession {
-    pub(crate) fn new(config: &Config, media: &MediaInfo) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(config: &Config, entries: Vec<MediaInfo>) -> Result<Self, Box<dyn Error>> {
+        let first = entries
+            .first()
+            .ok_or_else(|| error("Playlist requires at least one video"))?;
         let output_url = format!(
             "{}/{}",
             config.rtmp_url.trim_end_matches('/'),
             config.stream_key
         );
         let broadcast = BroadcastPipeline::build(&output_url)?;
-        let playback = PlaybackPipeline::build(config)?;
         set_title(
             &config.title_url,
             &config.title_token,
-            &format!("Starting soon: {}", media.title),
+            &format!("Starting soon: {}", first.title),
         )?;
         broadcast.pipeline.set_state(gst::State::Playing)?;
-        playback.pipeline.set_state(gst::State::Paused)?;
-        let audio_bridge = AudioBridge::start(
-            playback.audio_output.clone(),
-            broadcast.audio_source.clone(),
-            broadcast.pipeline.clone(),
-        )?;
         Ok(Self {
-            audio_bridge,
             broadcast,
-            playback,
+            active: None,
+            playlist: Playlist::new(entries),
             state: PlaybackState::Lobby,
             gain_db: DEFAULT_GAIN_DB,
             levels: AudioLevels::default(),
-            title: media.title.clone(),
             title_token: config.title_token.clone(),
             title_url: config.title_url.clone(),
-            subtitles: config.subtitles.clone(),
-            duration: media.duration,
         })
     }
 
@@ -1123,17 +1223,102 @@ impl StreamSession {
         if self.state != PlaybackState::Lobby {
             return Ok(());
         }
-        self.playback.wait_ready(self.subtitles.as_deref())?;
-        self.start_transition(Duration::from_secs(1))?;
-        set_title(&self.title_url, &self.title_token, &self.title)?;
+        if let Some(index) = self.playlist.start_target() {
+            self.activate_track(index, PlaybackState::Playing)?;
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     fn start_transition(&mut self, timeout: Duration) -> Result<(), Box<dyn Error>> {
-        self.playback.pipeline.set_state(gst::State::Playing)?;
-        self.playback.wait_for_frame_after(0, timeout)?;
+        let active = self
+            .active
+            .as_ref()
+            .ok_or_else(|| error("Playback is not active"))?;
+        active.playback.pipeline.set_state(gst::State::Playing)?;
+        active.playback.wait_for_frame_after(0, timeout)?;
         self.broadcast.select_movie();
         self.state = PlaybackState::Playing;
+        Ok(())
+    }
+
+    fn activate_track(
+        &mut self,
+        index: usize,
+        target_state: PlaybackState,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(active) = &self.active {
+            active.audio_bridge.set_paused(true);
+            self.broadcast.freeze(active.playback.latest_frame()?)?;
+        }
+        drop(self.active.take());
+
+        let entry = self
+            .playlist
+            .entries
+            .get(index)
+            .cloned()
+            .ok_or_else(|| error("Playlist entry is missing"))?;
+        let playback = PlaybackPipeline::build(&entry)?;
+        playback.pipeline.set_state(gst::State::Paused)?;
+        playback.wait_ready(entry.subtitles.as_deref())?;
+        let audio_bridge = AudioBridge::start(
+            playback.audio_output.clone(),
+            self.broadcast.audio_source.clone(),
+            self.broadcast.pipeline.clone(),
+        )?;
+        let active = ActivePlayback {
+            audio_bridge,
+            playback,
+        };
+        active.playback.pipeline.set_state(gst::State::Playing)?;
+        let frame = active
+            .playback
+            .wait_for_frame_after(0, Duration::from_secs(1))?;
+
+        self.update_title(index)?;
+        if target_state == PlaybackState::Paused {
+            active.audio_bridge.set_paused(true);
+            self.broadcast.freeze(frame)?;
+            active.playback.pipeline.set_state(gst::State::Paused)?;
+        } else {
+            self.broadcast.select_movie();
+        }
+        self.active = Some(active);
+        self.playlist.activate(index);
+        self.state = target_state;
+        Ok(())
+    }
+
+    fn update_title(&self, index: usize) -> Result<(), Box<dyn Error>> {
+        set_title(
+            &self.title_url,
+            &self.title_token,
+            &self.playlist.entries[index].title,
+        )
+    }
+
+    pub(crate) fn previous_track(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(index) = self.playlist.previous_target() {
+            let state = if self.state == PlaybackState::Paused {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            };
+            self.activate_track(index, state)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_track(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(index) = self.playlist.next_target() {
+            let state = if self.state == PlaybackState::Paused {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            };
+            self.activate_track(index, state)?;
+        }
         Ok(())
     }
 
@@ -1149,6 +1334,45 @@ impl StreamSession {
         self.levels
     }
 
+    pub(crate) fn add_entry(&mut self, entry: MediaInfo) {
+        self.playlist.push(entry);
+    }
+
+    pub(crate) fn entries(&self) -> &[MediaInfo] {
+        &self.playlist.entries
+    }
+
+    pub(crate) fn active_index(&self) -> Option<usize> {
+        self.playlist.active
+    }
+
+    pub(crate) fn selected_index(&self) -> usize {
+        self.playlist.selected
+    }
+
+    pub(crate) fn next_index(&self) -> usize {
+        self.playlist.next_index
+    }
+
+    pub(crate) fn active_path(&self) -> Option<&std::path::Path> {
+        self.playlist
+            .active
+            .and_then(|index| self.playlist.entries.get(index))
+            .map(|entry| entry.path.as_path())
+    }
+
+    pub(crate) fn select_entry(&mut self, delta: i32) {
+        self.playlist.select_by(delta);
+    }
+
+    pub(crate) fn move_selected(&mut self, delta: i32) {
+        self.playlist.move_selected(delta);
+    }
+
+    pub(crate) fn remove_selected(&mut self) {
+        self.playlist.remove_selected();
+    }
+
     pub(crate) fn adjust_gain(&mut self, steps: i8) {
         self.gain_db = adjusted_gain_db(self.gain_db, steps);
         self.broadcast
@@ -1157,23 +1381,36 @@ impl StreamSession {
     }
 
     pub(crate) fn title(&self) -> &str {
-        &self.title
+        self.display_entry()
+            .map_or("No track queued", |entry| entry.title.as_str())
     }
 
     pub(crate) fn duration(&self) -> gst::ClockTime {
-        self.duration
+        self.display_entry()
+            .map_or(gst::ClockTime::ZERO, |entry| entry.duration)
     }
 
     pub(crate) fn position(&self) -> gst::ClockTime {
-        self.playback
-            .pipeline
-            .query_position()
+        self.active
+            .as_ref()
+            .and_then(|active| active.playback.pipeline.query_position())
             .unwrap_or(gst::ClockTime::ZERO)
     }
 
+    fn display_entry(&self) -> Option<&MediaInfo> {
+        self.playlist
+            .active
+            .or_else(|| self.playlist.start_target())
+            .and_then(|index| self.playlist.entries.get(index))
+    }
+
     fn pause_playback(&self) -> Result<(), Box<dyn Error>> {
-        self.broadcast.freeze(self.playback.latest_frame()?)?;
-        self.playback.pipeline.set_state(gst::State::Paused)?;
+        let active = self
+            .active
+            .as_ref()
+            .ok_or_else(|| error("Playback is not active"))?;
+        self.broadcast.freeze(active.playback.latest_frame()?)?;
+        active.playback.pipeline.set_state(gst::State::Paused)?;
         Ok(())
     }
 
@@ -1182,16 +1419,24 @@ impl StreamSession {
             PlaybackState::Playing => {
                 // Hold the backlog before the broadcast leaves the movie pad,
                 // so no buffered audio is consumed into the discarded output.
-                self.audio_bridge.set_paused(true);
+                let active = self
+                    .active
+                    .as_ref()
+                    .ok_or_else(|| error("Playback is not active"))?;
+                active.audio_bridge.set_paused(true);
                 if let Err(failure) = self.pause_playback() {
-                    self.audio_bridge.set_paused(false);
+                    active.audio_bridge.set_paused(false);
                     return Err(failure);
                 }
                 self.state = PlaybackState::Paused;
             }
             PlaybackState::Paused => {
-                self.playback.pipeline.set_state(gst::State::Playing)?;
-                self.audio_bridge.set_paused(false);
+                let active = self
+                    .active
+                    .as_ref()
+                    .ok_or_else(|| error("Playback is not active"))?;
+                active.playback.pipeline.set_state(gst::State::Playing)?;
+                active.audio_bridge.set_paused(false);
                 self.broadcast.select_movie();
                 self.state = PlaybackState::Playing;
             }
@@ -1204,28 +1449,33 @@ impl StreamSession {
         if self.state == PlaybackState::Lobby {
             return Ok(());
         }
-        let target = seek_target(self.position(), self.duration, seconds);
-        let keep_last_frame = self.state == PlaybackState::Paused && target == self.duration;
-        let generation = self.playback.frame_generation();
+        let duration = self.duration();
+        let target = seek_target(self.position(), duration, seconds);
+        let keep_last_frame = self.state == PlaybackState::Paused && target == duration;
+        let active = self
+            .active
+            .as_ref()
+            .ok_or_else(|| error("Playback is not active"))?;
+        let generation = active.playback.frame_generation();
         // Audio buffered from before the seek belongs to the old position.
         // Flush ahead of the seek so none of it is broadcast while the playback
         // pipeline settles, and again afterwards to drop whatever the sink
         // handed over mid-seek.
-        self.audio_bridge.flush();
-        let seek = self
+        active.audio_bridge.flush();
+        let seek = active
             .playback
             .pipeline
             .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, target);
-        self.audio_bridge.flush();
+        active.audio_bridge.flush();
         seek?;
         if self.state == PlaybackState::Paused {
-            let state_change = self
+            let state_change = active
                 .playback
                 .pipeline
                 .state(gst::ClockTime::from_seconds(5))
                 .0;
             PlaybackPipeline::check_bus_errors(
-                &self
+                &active
                     .playback
                     .pipeline
                     .bus()
@@ -1237,7 +1487,7 @@ impl StreamSession {
             if keep_last_frame {
                 return Ok(());
             }
-            let frame = self
+            let frame = active
                 .playback
                 .wait_for_frame_after(generation, Duration::from_secs(1))?;
             self.broadcast.freeze(frame)?;
@@ -1245,27 +1495,35 @@ impl StreamSession {
         Ok(())
     }
 
-    pub(crate) fn poll(&mut self) -> Result<SessionEvent, Box<dyn Error>> {
+    pub(crate) fn poll(&mut self) -> Result<(), Box<dyn Error>> {
         while gst::glib::MainContext::default().pending() {
             gst::glib::MainContext::default().iteration(false);
         }
-        let playback_bus = self
-            .playback
-            .pipeline
-            .bus()
-            .ok_or_else(|| error("Playback bus is missing"))?;
-        while let Some(message) = playback_bus.timed_pop(gst::ClockTime::ZERO) {
-            if self
+        let mut eos = false;
+        if let Some(active) = &self.active {
+            let playback_bus = active
                 .playback
-                .handle_stream_collection(&message, self.subtitles.as_deref())
-            {
-                continue;
-            }
-            if let Some(failure) = bus_error(&message) {
-                return Err(error(failure));
-            }
-            if matches!(message.view(), gst::MessageView::Eos(_)) {
-                return Ok(SessionEvent::Finished);
+                .pipeline
+                .bus()
+                .ok_or_else(|| error("Playback bus is missing"))?;
+            let subtitles = self
+                .playlist
+                .active
+                .and_then(|index| self.playlist.entries.get(index))
+                .and_then(|entry| entry.subtitles.as_deref());
+            while let Some(message) = playback_bus.timed_pop(gst::ClockTime::ZERO) {
+                if active
+                    .playback
+                    .handle_stream_collection(&message, subtitles)
+                {
+                    continue;
+                }
+                if let Some(failure) = bus_error(&message) {
+                    return Err(error(failure));
+                }
+                if matches!(message.view(), gst::MessageView::Eos(_)) {
+                    eos = true;
+                }
             }
         }
         let broadcast_bus = self
@@ -1282,7 +1540,16 @@ impl StreamSession {
                 return Err(error(failure));
             }
         }
-        Ok(SessionEvent::Running)
+        if eos {
+            if let Some(next) = self.playlist.finish_target() {
+                self.activate_track(next, PlaybackState::Playing)?;
+            } else {
+                self.broadcast.select_lobby();
+                drop(self.active.take());
+                self.state = PlaybackState::Lobby;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1290,6 +1557,8 @@ impl StreamSession {
 mod tests {
     use super::*;
     use std::{
+        io::{Read, Write},
+        net::TcpListener,
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
@@ -1304,16 +1573,226 @@ mod tests {
         guard
     }
 
-    fn config() -> Config {
-        Config {
-            video: PathBuf::from("/tmp/movie.mkv"),
+    fn entry(title: &str) -> MediaInfo {
+        MediaInfo {
+            path: PathBuf::from(format!("/tmp/{title}.mkv")),
             subtitles: None,
-            title: None,
-            stream_key: String::new(),
-            title_token: String::new(),
-            rtmp_url: String::new(),
-            title_url: String::new(),
+            title: title.into(),
+            duration: gst::ClockTime::from_seconds(60),
         }
+    }
+
+    #[test]
+    fn playlist_locks_active_row_and_both_crossing_moves() {
+        let mut playlist = Playlist::new(vec![
+            entry("one"),
+            entry("two"),
+            entry("three"),
+            entry("four"),
+        ]);
+        playlist.activate(1);
+
+        playlist.selected = 1;
+        assert!(!playlist.remove_selected());
+        assert!(!playlist.move_selected(1));
+
+        playlist.selected = 0;
+        assert!(!playlist.move_selected(1));
+        playlist.selected = 2;
+        assert!(!playlist.move_selected(-1));
+        assert_eq!(
+            playlist
+                .entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three", "four"]
+        );
+    }
+
+    #[test]
+    fn playlist_reorders_and_removes_unlocked_rows() {
+        let mut playlist = Playlist::new(vec![
+            entry("one"),
+            entry("two"),
+            entry("three"),
+            entry("four"),
+        ]);
+        playlist.activate(1);
+        playlist.selected = 2;
+
+        assert!(playlist.move_selected(1));
+        assert_eq!(playlist.selected, 3);
+        assert!(playlist.remove_selected());
+        assert_eq!(
+            playlist
+                .entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "four"]
+        );
+        assert_eq!(playlist.active, Some(1));
+    }
+
+    #[test]
+    fn playlist_tracks_start_previous_next_and_final_lobby() {
+        let mut playlist = Playlist::new(vec![entry("one"), entry("two")]);
+
+        assert_eq!(playlist.start_target(), Some(0));
+        playlist.activate(0);
+        assert_eq!(playlist.previous_target(), None);
+        assert_eq!(playlist.next_target(), Some(1));
+
+        playlist.activate(1);
+        assert_eq!(playlist.previous_target(), Some(0));
+        assert_eq!(playlist.next_target(), None);
+        assert_eq!(playlist.finish_target(), None);
+        assert_eq!(playlist.active, None);
+        assert_eq!(playlist.next_index, 2);
+
+        playlist.push(entry("three"));
+        assert_eq!(playlist.start_target(), Some(2));
+        assert_eq!(playlist.previous_target(), Some(1));
+    }
+
+    #[test]
+    fn playlist_does_not_move_pending_entries_into_played_final_lobby_rows() {
+        let mut playlist = Playlist::new(vec![entry("one"), entry("two")]);
+        playlist.activate(1);
+        assert_eq!(playlist.finish_target(), None);
+        playlist.push(entry("three"));
+
+        assert!(!playlist.move_selected(-1));
+        assert_eq!(
+            playlist
+                .entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+        assert_eq!(playlist.start_target(), Some(2));
+    }
+
+    #[test]
+    fn session_exposes_playlist_edits() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+
+        session.add_entry(entry("Alien"));
+        assert_eq!(
+            session
+                .entries()
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Passenger", "Alien"]
+        );
+        assert_eq!(session.active_index(), Some(0));
+
+        session.select_entry(1);
+        session.move_selected(-1);
+        assert_eq!(
+            session
+                .entries()
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Passenger", "Alien"]
+        );
+        session.remove_selected();
+        assert_eq!(session.entries().len(), 1);
+    }
+
+    #[test]
+    fn session_track_navigation_is_a_noop_at_playlist_boundaries() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+
+        session.previous_track().unwrap();
+        session.next_track().unwrap();
+
+        assert_eq!(session.active_index(), Some(0));
+        assert_eq!(session.title(), "Passenger");
+    }
+
+    #[test]
+    fn polling_final_eos_returns_to_lobby_without_finishing_session() {
+        let _gst = gst_test();
+        let mut session = session_with_fakesink();
+        session.state = PlaybackState::Playing;
+        session
+            .active
+            .as_ref()
+            .unwrap()
+            .playback
+            .pipeline
+            .bus()
+            .unwrap()
+            .post(gst::message::Eos::builder().build())
+            .unwrap();
+
+        session.poll().unwrap();
+
+        assert_eq!(session.state(), PlaybackState::Lobby);
+        assert_eq!(session.active_index(), None);
+        assert_eq!(session.title(), "No track queued");
+    }
+
+    #[test]
+    fn track_activation_updates_owncast_title() {
+        let _gst = gst_test();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut session = session_with_fakesink();
+        session.add_entry(entry("Alien"));
+        session.title_token = "token".into();
+        session.title_url = format!("http://{address}/");
+
+        session.update_title(1).unwrap();
+        let request = server.join().unwrap();
+
+        assert!(request.contains("POST / HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer token")
+        );
+        let compact = request
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains(r#"{"value":"Alien"}"#));
     }
 
     fn level_message(peak: [f64; 2], decay: [f64; 2]) -> gst::Message {
@@ -1341,31 +1820,35 @@ mod tests {
         let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
         let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
         pipeline.add_many([&movie, &subtitle_overlay]).unwrap();
+        let mut media = entry("Passenger");
+        media.duration = gst::ClockTime::from_seconds(100);
+        let mut playlist = Playlist::new(vec![media]);
+        playlist.activate(0);
         StreamSession {
-            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
-            playback: PlaybackPipeline {
-                pipeline,
-                movie,
-                audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
-                subtitle_overlay,
-                sinks: SelectedSinks {
-                    video: gst::Pad::new(gst::PadDirection::Sink),
-                    audio: gst::Pad::new(gst::PadDirection::Sink),
-                    subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            active: Some(ActivePlayback {
+                audio_bridge: AudioBridge::idle(),
+                playback: PlaybackPipeline {
+                    pipeline,
+                    movie,
+                    audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
+                    subtitle_overlay,
+                    sinks: SelectedSinks {
+                        video: gst::Pad::new(gst::PadDirection::Sink),
+                        audio: gst::Pad::new(gst::PadDirection::Sink),
+                        subtitle: gst::Pad::new(gst::PadDirection::Sink),
+                    },
+                    selection: Arc::new(OnceLock::new()),
+                    setup: Arc::new(Mutex::new(SetupState::default())),
+                    latest_frame: Arc::new(Mutex::new(None)),
                 },
-                selection: Arc::new(OnceLock::new()),
-                setup: Arc::new(Mutex::new(SetupState::default())),
-                latest_frame: Arc::new(Mutex::new(None)),
-            },
+            }),
+            playlist,
             state: PlaybackState::Lobby,
             gain_db: DEFAULT_GAIN_DB,
             levels: AudioLevels::default(),
-            title: "Passenger".into(),
             title_token: String::new(),
             title_url: String::new(),
-            subtitles: None,
-            duration: gst::ClockTime::from_seconds(100),
         }
     }
 
@@ -1433,31 +1916,35 @@ mod tests {
                 .unwrap();
         let movie = gst::ElementFactory::make("fakesrc").build().unwrap();
         let subtitle_overlay = gst::ElementFactory::make("identity").build().unwrap();
+        let mut media = entry("Passenger");
+        media.duration = gst::ClockTime::from_seconds(30);
+        let mut playlist = Playlist::new(vec![media]);
+        playlist.activate(0);
         StreamSession {
-            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
-            playback: PlaybackPipeline {
-                pipeline,
-                movie,
-                audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
-                subtitle_overlay,
-                sinks: SelectedSinks {
-                    video: gst::Pad::new(gst::PadDirection::Sink),
-                    audio: gst::Pad::new(gst::PadDirection::Sink),
-                    subtitle: gst::Pad::new(gst::PadDirection::Sink),
+            active: Some(ActivePlayback {
+                audio_bridge: AudioBridge::idle(),
+                playback: PlaybackPipeline {
+                    pipeline,
+                    movie,
+                    audio_output: gst::ElementFactory::make("appsink").build().unwrap(),
+                    subtitle_overlay,
+                    sinks: SelectedSinks {
+                        video: gst::Pad::new(gst::PadDirection::Sink),
+                        audio: gst::Pad::new(gst::PadDirection::Sink),
+                        subtitle: gst::Pad::new(gst::PadDirection::Sink),
+                    },
+                    selection: Arc::new(OnceLock::new()),
+                    setup: Arc::new(Mutex::new(SetupState::default())),
+                    latest_frame,
                 },
-                selection: Arc::new(OnceLock::new()),
-                setup: Arc::new(Mutex::new(SetupState::default())),
-                latest_frame,
-            },
+            }),
+            playlist,
             state: PlaybackState::Lobby,
             gain_db: DEFAULT_GAIN_DB,
             levels: AudioLevels::default(),
-            title: "Passenger".into(),
             title_token: String::new(),
             title_url: String::new(),
-            subtitles: None,
-            duration: gst::ClockTime::from_seconds(30),
         }
     }
 
@@ -1571,12 +2058,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(frozen.lock().unwrap().take().is_some());
-        let generation = session.playback.frame_generation();
+        let generation = session.active.as_ref().unwrap().playback.frame_generation();
 
         session.seek_by(3).unwrap();
 
-        assert!(session.playback.frame_generation() > generation);
-        let current = session.playback.latest_frame().unwrap();
+        assert!(session.active.as_ref().unwrap().playback.frame_generation() > generation);
+        let current = session
+            .active
+            .as_ref()
+            .unwrap()
+            .playback
+            .latest_frame()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while frozen.lock().unwrap().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1625,6 +2118,9 @@ mod tests {
         let sought = Arc::new(AtomicBool::new(false));
         let observed_seek = sought.clone();
         session
+            .active
+            .as_ref()
+            .unwrap()
             .playback
             .pipeline
             .by_name("movie_video_output")
@@ -1686,8 +2182,18 @@ mod tests {
         }
         let freeze_count = freezes.load(Ordering::Relaxed);
         assert!(freeze_count > 0);
-        let bus = session.playback.pipeline.bus().unwrap();
+        let bus = session
+            .active
+            .as_ref()
+            .unwrap()
+            .playback
+            .pipeline
+            .bus()
+            .unwrap();
         session
+            .active
+            .as_ref()
+            .unwrap()
             .playback
             .pipeline
             .by_name("movie_video_output")
@@ -1889,7 +2395,7 @@ mod tests {
     fn broadcast_and_playback_use_separate_pipelines() {
         let _gst = gst_test();
         let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
-        let playback = PlaybackPipeline::build(&config()).unwrap();
+        let playback = PlaybackPipeline::build(&entry("movie")).unwrap();
         broadcast.pipeline.set_state(gst::State::Playing).unwrap();
         broadcast
             .pipeline
@@ -1923,6 +2429,30 @@ mod tests {
         assert!(
             (broadcast.audio_gain.property::<f64>("volume") - db_to_amplitude(3.0)).abs()
                 < 0.000001
+        );
+    }
+
+    #[test]
+    fn broadcast_can_return_from_movie_to_lobby() {
+        let _gst = gst_test();
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        broadcast.pipeline.set_state(gst::State::Playing).unwrap();
+        broadcast
+            .pipeline
+            .state(gst::ClockTime::from_seconds(1))
+            .0
+            .unwrap();
+
+        broadcast.select_movie();
+        broadcast.select_lobby();
+
+        assert_eq!(
+            broadcast.video_selector.property::<gst::Pad>("active-pad"),
+            broadcast.video_lobby_pad
+        );
+        assert_eq!(
+            broadcast.audio_selector.property::<gst::Pad>("active-pad"),
+            broadcast.audio_lobby_pad
         );
     }
 
@@ -1971,6 +2501,55 @@ mod tests {
             broadcast.audio_lobby_pad
         );
         playback.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn synthetic_track_replacement_keeps_broadcast_live() {
+        let _gst = gst_test();
+        let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
+        let source = || {
+            gst::parse::launch(&format!(
+                "videotestsrc is-live=true ! videoconvert \
+                 ! video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 \
+                 ! intervideosink channel={INTER_CHANNEL} sync=true"
+            ))
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap()
+        };
+        let first = source();
+        let second = source();
+        let frames = Arc::new(AtomicU64::new(0));
+        let counted = frames.clone();
+        broadcast
+            .video_selector
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        broadcast.pipeline.set_state(gst::State::Playing).unwrap();
+        let broadcast_ptr = broadcast.pipeline.as_ptr();
+
+        first.set_state(gst::State::Playing).unwrap();
+        broadcast.select_movie();
+        std::thread::sleep(Duration::from_millis(150));
+        let after_first = frames.load(Ordering::Relaxed);
+
+        broadcast.select_lobby();
+        first.set_state(gst::State::Null).unwrap();
+        second.set_state(gst::State::Playing).unwrap();
+        broadcast.select_movie();
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(broadcast.pipeline.as_ptr(), broadcast_ptr);
+        assert!(after_first > 0);
+        assert!(frames.load(Ordering::Relaxed) > after_first);
+
+        second.set_state(gst::State::Null).unwrap();
+        broadcast.pipeline.set_state(gst::State::Null).unwrap();
     }
 
     #[test]
@@ -2131,14 +2710,32 @@ mod tests {
 
         assert_eq!(session.state(), PlaybackState::Paused);
         assert!(
-            session.audio_bridge.state.lock().unwrap().paused,
+            session
+                .active
+                .as_ref()
+                .unwrap()
+                .audio_bridge
+                .state
+                .lock()
+                .unwrap()
+                .paused,
             "paused playback kept draining the audio backlog"
         );
 
         session.toggle_pause().unwrap();
 
         assert_eq!(session.state(), PlaybackState::Playing);
-        assert!(!session.audio_bridge.state.lock().unwrap().paused);
+        assert!(
+            !session
+                .active
+                .as_ref()
+                .unwrap()
+                .audio_bridge
+                .state
+                .lock()
+                .unwrap()
+                .paused
+        );
     }
 
     #[test]
@@ -2147,6 +2744,9 @@ mod tests {
         let mut session = session_with_fakesink();
         session.state = PlaybackState::Playing;
         session
+            .active
+            .as_ref()
+            .unwrap()
             .audio_bridge
             .state
             .lock()
@@ -2156,7 +2756,17 @@ mod tests {
 
         session.seek_by(-5).unwrap();
 
-        assert!(session.audio_bridge.state.lock().unwrap().flush);
+        assert!(
+            session
+                .active
+                .as_ref()
+                .unwrap()
+                .audio_bridge
+                .state
+                .lock()
+                .unwrap()
+                .flush
+        );
     }
 
     #[test]
@@ -2230,16 +2840,24 @@ mod tests {
     fn av_sync_probe() {
         let _gst = gst_test();
         let config = Config {
+            startup_dir: PathBuf::from("/tmp"),
             video: std::env::var("PROBE_VIDEO").unwrap().into(),
             subtitles: None,
             title: None,
+            queued_videos: Vec::new(),
             stream_key: String::new(),
             title_token: String::new(),
             rtmp_url: String::new(),
             title_url: String::new(),
         };
         let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
-        let playback = PlaybackPipeline::build(&config).unwrap();
+        let playback = PlaybackPipeline::build(&MediaInfo {
+            path: config.video,
+            subtitles: None,
+            title: "Probe".into(),
+            duration: gst::ClockTime::from_seconds(1),
+        })
+        .unwrap();
         let log = Arc::new(Mutex::new(
             std::fs::File::create(std::env::var("PROBE_OUT").unwrap()).unwrap(),
         ));
@@ -2334,16 +2952,24 @@ mod tests {
     fn audio_bridge_continuity_probe() {
         let _gst = gst_test();
         let config = Config {
+            startup_dir: PathBuf::from("/tmp"),
             video: std::env::var("PROBE_VIDEO").unwrap().into(),
             subtitles: None,
             title: None,
+            queued_videos: Vec::new(),
             stream_key: String::new(),
             title_token: String::new(),
             rtmp_url: String::new(),
             title_url: String::new(),
         };
         let broadcast = BroadcastPipeline::build_with_sink("fakesink").unwrap();
-        let playback = PlaybackPipeline::build(&config).unwrap();
+        let playback = PlaybackPipeline::build(&MediaInfo {
+            path: config.video,
+            subtitles: None,
+            title: "Probe".into(),
+            duration: gst::ClockTime::from_seconds(1),
+        })
+        .unwrap();
         let capture = Arc::new(Mutex::new(
             std::fs::File::create(std::env::var("PROBE_OUT").unwrap()).unwrap(),
         ));
@@ -2475,25 +3101,35 @@ mod tests {
             setup: Arc::new(Mutex::new(SetupState::default())),
             latest_frame: Arc::new(Mutex::new(None)),
         };
+        let mut media = entry("Passenger");
+        media.duration = gst::ClockTime::from_seconds(30);
+        let mut playlist = Playlist::new(vec![media]);
+        playlist.activate(0);
         let mut session = StreamSession {
-            audio_bridge: AudioBridge::idle(),
             broadcast: BroadcastPipeline::build_with_sink("fakesink").unwrap(),
-            playback,
+            active: Some(ActivePlayback {
+                audio_bridge: AudioBridge::idle(),
+                playback,
+            }),
+            playlist,
             state: PlaybackState::Playing,
             gain_db: DEFAULT_GAIN_DB,
             levels: AudioLevels::default(),
-            title: "Passenger".into(),
             title_token: String::new(),
             title_url: String::new(),
-            subtitles: None,
-            duration: gst::ClockTime::from_seconds(30),
         };
         session
+            .active
+            .as_ref()
+            .unwrap()
             .playback
             .pipeline
             .set_state(gst::State::Playing)
             .unwrap();
         session
+            .active
+            .as_ref()
+            .unwrap()
             .playback
             .pipeline
             .state(gst::ClockTime::from_seconds(1))
