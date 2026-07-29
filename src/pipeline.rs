@@ -1120,7 +1120,15 @@ impl Playlist {
         let Some(target) = target.filter(|target| *target < self.entries.len()) else {
             return false;
         };
-        if self.active == Some(self.selected) || self.active == Some(target) {
+        let crosses = |boundary: usize| {
+            (self.selected < boundary && target >= boundary)
+                || (target < boundary && self.selected >= boundary)
+        };
+        if let Some(active) = self.active {
+            if self.selected == active || target == active || crosses(active) {
+                return false;
+            }
+        } else if crosses(self.next_index) {
             return false;
         }
         self.entries.swap(self.selected, target);
@@ -1646,6 +1654,25 @@ mod tests {
         playlist.push(entry("three"));
         assert_eq!(playlist.start_target(), Some(2));
         assert_eq!(playlist.previous_target(), Some(1));
+    }
+
+    #[test]
+    fn playlist_does_not_move_pending_entries_into_played_final_lobby_rows() {
+        let mut playlist = Playlist::new(vec![entry("one"), entry("two")]);
+        playlist.activate(1);
+        assert_eq!(playlist.finish_target(), None);
+        playlist.push(entry("three"));
+
+        assert!(!playlist.move_selected(-1));
+        assert_eq!(
+            playlist
+                .entries
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+        assert_eq!(playlist.start_target(), Some(2));
     }
 
     #[test]

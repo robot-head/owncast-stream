@@ -1,7 +1,7 @@
 # owncast-stream
 
 A small Rust/GStreamer streamer for Owncast. It keeps one RTMP connection open
-while switching from a generated lobby to one movie.
+while switching between a generated lobby and queued videos.
 
 ![TUI Demo](./docs/demo.gif)
 

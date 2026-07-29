@@ -202,7 +202,7 @@ fn chooser_command_for_key(key: event::KeyEvent) -> Option<ChooserCommand> {
         (KeyCode::Down, _) => Some(ChooserCommand::Select(1)),
         (KeyCode::Enter, _) => Some(ChooserCommand::Activate),
         (KeyCode::Backspace, _) => Some(ChooserCommand::Parent),
-        (KeyCode::Esc | KeyCode::Char('q'), _) => Some(ChooserCommand::Cancel),
+        (KeyCode::Esc, _) => Some(ChooserCommand::Cancel),
         _ => None,
     }
 }
@@ -532,7 +532,9 @@ pub(crate) fn run(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('q')
+            || key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             return Ok(());
         }
         if chooser.is_some() {
@@ -991,7 +993,7 @@ mod tests {
         assert_eq!(command(KeyCode::Enter), Some(ChooserCommand::Activate));
         assert_eq!(command(KeyCode::Backspace), Some(ChooserCommand::Parent));
         assert_eq!(command(KeyCode::Esc), Some(ChooserCommand::Cancel));
-        assert_eq!(command(KeyCode::Char('q')), Some(ChooserCommand::Cancel));
+        assert_eq!(command(KeyCode::Char('q')), None);
         assert_eq!(command(KeyCode::Char('n')), None);
     }
 
